@@ -1,0 +1,168 @@
+import pandas as pd
+import numpy as np
+import os
+from datetime import timedelta
+
+# --- 辅助函数：根据日历天数滚动 ---
+def get_rolling_periods_calendar_days(big_period_start, big_period_end, window_days=180, step_days=20):
+    """
+    根据日历天数确定 180 天窗口、20 天步长的滚动周期。
+
+    :param big_period_start: 大周期的开始日期 (Datetime)。
+    :param big_period_end: 大周期的结束日期 (Datetime)。
+    :param window_days: 滚动窗口大小 (日历天数)。
+    :param step_days: 滚动步长 (日历天数)。
+    :return: 包含 (start_date, end_date, sheet_name) 的列表。
+    """
+    periods = []
+
+    # 将步长和窗口大小转换为 timedelta 对象
+    step_delta = pd.Timedelta(days=step_days)
+    window_delta = pd.Timedelta(days=window_days)
+
+    # 确定第一个滚动周期的结束日期
+    # 如: '2022-12-12' + 20天 = '2023-01-01'
+    current_end = big_period_start + step_delta
+
+    # 循环滚动直到覆盖大周期的结束日期
+    while True:
+        # 确定当前滚动窗口的开始日期
+        # 如: '2023-01-01' - 180天 = '2022-07-05'
+        current_start = current_end - window_delta
+
+        # 窗口的名称
+        sheet_name = f"{current_start.strftime('%Y-%m-%d')}_to_{current_end.strftime('%Y-%m-%d')}"
+
+        periods.append((current_start, current_end, sheet_name))
+
+        # 检查是否应该停止：如果当前窗口的结束日期已经达到或超过了大周期的结束日期
+        # 注意：最后一个周期要包含 big_period_end 这一天
+        if current_end >= big_period_end:
+            break
+
+        # 滚动到下一个周期
+        current_end += step_delta
+
+        # 如果下一步滚动超过了太多，将 current_end 限制为 big_period_end
+        # 确保最后一个窗口的结束日期恰好是 big_period_end 之后，以包含它
+        if current_end > big_period_end and big_period_end not in [p[1] for p in periods]:
+            # 这是一个修正，确保最后一个窗口的结束日是 big_period_end
+            # 实际上，由于我们要求最后一个周期要包含 big_period_end，我们可以直接在循环外处理这最后一步
+            pass # 让循环继续，直到 current_end 超过 big_period_end
+
+    # 确保最后一个周期包含 big_period_end：
+    # 如果最后一个记录的周期 end_date 小于 big_period_end，则手动添加一个覆盖的周期
+    last_period_end = periods[-1][1]
+    if last_period_end > big_period_end:
+         # 如果最后一个周期超出了 big_period_end，我们调整它，让它的结束日是 big_period_end
+         # 但是，由于我们希望步长是 20 天，通常是允许最后一个周期略微超出
+         # 最简单的处理是：如果 current_end 已经超过 big_period_end，我们已经在 while True 循环中捕获并停止了
+         pass # 不需要额外处理，因为我们是逐步增加 current_end
+
+    return periods
+
+
+def calculate_stock_covariance_all_periods():
+    try:
+        # 文件路径
+        file_path = r"C:\Users\cufet\Desktop\中证500成分股数据-快照2.xlsx"
+        output_dir = r"C:\Users\cufet\Desktop"
+
+        # 定义七个大周期和对应的 Excel 文件名 (现在是日历日期)
+        big_periods = [
+            ('2022-12-12', '2023-06-12', '2023上'), # 182 天
+            ('2023-06-12', '2023-12-11', '2023下'), # 182 天
+            ('2023-12-11', '2024-06-17', '2024上'), # 189 天 (闰年效应)
+            ('2024-06-17', '2024-12-16', '2024下'), # 182 天
+            ('2024-12-17', '2025-06-16', '2025上'), # 181 天
+            ('2025-06-16', '2025-09-30', '2025下'), # 106 天
+        ]
+
+        # 核心数据读取（只执行一次）
+        print("1. 正在读取原始数据并预处理...")
+        df = pd.read_excel(file_path, sheet_name='Sheet1', index_col=0)
+        df.index = pd.to_datetime(df.index)
+
+        print(f"   -> 原始数据形状: {df.shape}")
+
+        # 遍历每个大周期，并为每个大周期创建一个独立的 Excel 文件
+        for big_start_str, big_end_str, big_period_name in big_periods:
+
+            # 将字符串转换为 Datetime 对象
+            big_start_date = pd.to_datetime(big_start_str)
+            big_end_date = pd.to_datetime(big_end_str)
+            output_file_name = f"{big_period_name}_协方差.xlsx"
+            output_path = os.path.join(output_dir, output_file_name)
+
+            print(f"\n--- 正在处理大周期: {big_period_name} ({big_start_str} to {big_end_str}) ---")
+
+            # 2. 生成滚动周期列表 (基于日历天数)
+            rolling_periods = get_rolling_periods_calendar_days(
+                big_period_start=big_start_date,
+                big_period_end=big_end_date,
+                window_days=180,
+                step_days=20
+            )
+
+            if not rolling_periods:
+                print(f"警告: 周期 {big_period_name} 无法生成有效的滚动窗口，跳过。")
+                continue
+
+            print(f"   -> 共生成 {len(rolling_periods)} 个滚动窗口。")
+
+            # 3. 使用 ExcelWriter 写入多个 Sheet
+            with pd.ExcelWriter(output_path, mode='w', engine='xlsxwriter') as writer:
+
+                for small_start_date, small_end_date, sheet_name in rolling_periods:
+
+                    # 4. 筛选指定时间范围的数据（180个日历天）
+                    # 注意：这里是闭区间 [small_start_date, small_end_date]
+                    mask = (df.index >= small_start_date) & (df.index <= small_end_date)
+                    period_data = df.loc[mask]
+
+                    if len(period_data) < 2:
+                        print(f"警告: 周期 {sheet_name} ({small_start_date.strftime('%Y-%m-%d')} to {small_end_date.strftime('%Y-%m-%d')}) 数据不足 2 天，跳过。")
+                        continue
+
+                    # 5. 缺失值处理
+                    # 缺失值筛选 (30% 阈值)
+                    missing_ratio = period_data.isnull().sum() / len(period_data)
+                    threshold = 0.3
+                    valid_columns = missing_ratio[missing_ratio <= threshold].index
+                    cleaned_data = period_data[valid_columns]
+
+                    # 使用前一个有效值填充缺失值，然后再用后一个有效值填充
+                    cleaned_data = cleaned_data.ffill().bfill()
+
+                    if cleaned_data.isnull().sum().sum() > 0:
+                        # 如果仍有 NaN，说明某些股票在整个 180 天都没有数据，直接丢弃这些列
+                        cleaned_data = cleaned_data.dropna(axis=1)
+
+                    if len(cleaned_data) < 2:
+                        continue
+
+                    # 6. 计算收益率和协方差
+                    returns = np.log(cleaned_data / cleaned_data.shift(1)).dropna()
+
+                    # 确保收益率数据量足够 (至少 1 个)
+                    if len(returns) < 1:
+                        continue
+
+                    covariance_matrix = returns.cov()
+
+                    # 7. 年化协方差矩阵 (原代码中使用 $\times 20$，保留此系数)
+                    annualized_covariance = covariance_matrix * 20
+
+                    # 8. 保存到 Excel 的一个 Sheet 中
+                    annualized_covariance.to_excel(writer, sheet_name=sheet_name)
+                    print(f"      -> 成功计算并保存 Sheet: {sheet_name}")
+
+            print(f"--- 大周期 {big_period_name} 所有滚动协方差矩阵已保存到 {output_path} ---")
+
+    except Exception as e:
+        print(f'!!! 严重错误: 整个计算过程出现问题: {e}')
+        return None
+
+# 执行计算
+if __name__ == "__main__":
+    calculate_stock_covariance_all_periods()
