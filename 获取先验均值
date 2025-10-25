@@ -1,0 +1,238 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import os
+
+# --- 1. 定义常量和文件路径 ---
+# 使用用户提供的新周期定义
+PERIODS = ['2023上', '2023下', '2024上', '2024下', '2025上', '2025下']
+
+# 新的半年周期边界（左闭右开原则：[start, end)）
+# 使用用户提供的新边界
+HALF_YEAR_BOUNDARIES = [
+    ('2022-12-12', '2023-06-12'),
+    ('2023-06-12', '2023-12-11'),
+    ('2023-12-11', '2024-06-17'),
+    ('2024-06-17', '2024-12-16'),
+    ('2024-12-16', '2025-06-16'),
+    ('2025-06-16', '2025-09-30')  # 假设 2025下 周期以这个日期结束
+]
+
+# 输入文件路径
+DELTA_MARKET_CAP_PATH = r"C:\Users\cufet\Desktop\中证500成分股数据-快照2.xlsx"
+# COVARIANCE_PATH 是包含协方差 Excel 文件的目录路径
+COVARIANCE_PATH = r"C:\Users\cufet\Desktop\协方差"
+# 输出目录
+OUTPUT_DIR = r"C:\Users\cufet\Desktop\先验均值pai"
+
+
+# --- 2. 辅助函数：根据交易日数量划分周期 ---
+def split_into_20_day_periods(dates: pd.DatetimeIndex) -> list:
+    """
+    将日期索引划分为每20个交易日的小周期。
+    :param dates: 包含所有交易日的 DatetimeIndex。
+    :return: 包含 (start_date, end_date) 元组的列表。
+    """
+    periods = []
+    num_dates = len(dates)
+
+    for i in range(0, num_dates, 20):
+        # 周期开始日期（左闭）
+        start_date = dates[i]
+
+        # 周期结束日期（右开，即下一个周期的开始日期）
+        if i + 20 < num_dates:
+            end_date = dates[i + 20]
+        else:
+            # 最后一个周期，取其最后一个日期作为标记
+            end_date = dates[-1]
+
+        # 记录周期 (开始日期, 结束日期)
+        periods.append((start_date, end_date))
+
+    return periods
+
+
+# --- 3. 数据加载与预处理 ---
+
+# 3.1. 加载 $\delta$ (风险溢价) 数据
+try:
+    print("1. 正在加载风险溢价 (delta) 数据...")
+    # Sheet2: A列是日期, H列是风险溢价
+    delta_df_raw = pd.read_excel(DELTA_MARKET_CAP_PATH, sheet_name='Sheet2')
+    # 假设 A列是第0列，H列是第7列
+    delta_df_raw['Date'] = pd.to_datetime(delta_df_raw.iloc[:, 0])
+    delta_df = delta_df_raw[['Date', delta_df_raw.columns[7]]].copy()
+    delta_df.columns = ['Date', 'Risk_Premium']
+    delta_df = delta_df.set_index('Date').sort_index()
+    print(f"   -> 风险溢价数据形状: {delta_df.shape}")
+except Exception as e:
+    print(f"!!! 严重错误: 加载风险溢价数据失败: {e}")
+    exit()
+
+# 3.2. 加载 $\omega$ (自由流通市值) 数据 - 针对多重表头结构修正
+try:
+    print("2. 正在加载自由流通市值 (Market Cap) 数据...")
+
+    # 使用 header=None 读取原始数据
+    market_cap_df_raw = pd.read_excel(DELTA_MARKET_CAP_PATH, sheet_name='自由流通市值', header=None)
+
+    # 1. 确定股票代码（列名）：Excel 第 3 行 (索引 2)，从 B 列 (索引 1) 开始
+    stock_codes = market_cap_df_raw.iloc[2, 1:].astype(str).tolist()
+
+    # 2. 确定日期（索引）：Excel 第 4 行 (索引 3) 开始，在 A 列 (索引 0)
+    dates_col = market_cap_df_raw.iloc[3:, 0]
+    dates_col = pd.to_datetime(dates_col, errors='coerce').dropna()
+
+    # 3. 确定市值数据：从 Excel 第 4 行 (索引 3)，从 B 列 (索引 1) 开始
+    market_cap_df = market_cap_df_raw.iloc[3:, 1:]
+
+    # 4. 设置列名和索引
+    market_cap_df = market_cap_df.loc[dates_col.index]
+    market_cap_df.columns = stock_codes
+    market_cap_df.index = dates_col.tolist()
+    market_cap_df.index.name = 'Date'
+
+    # 5. 转换为数值类型并排序
+    market_cap_df = market_cap_df.apply(pd.to_numeric, errors='coerce')
+    market_cap_df = market_cap_df.sort_index()
+    print(f"   -> 市值数据形状: {market_cap_df.shape}")
+
+except Exception as e:
+    print(f"!!! 严重错误: 加载市值数据失败: {e}")
+    raise
+
+print("3. 协方差矩阵 (Sigma) 将在计算时按需加载。")
+
+# --- 4. 核心计算逻辑 ---
+
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+print(f"\n--- 4. 启动多周期矩阵乘法计算 ($\Pi = \delta \Sigma \omega$) ---")
+
+# 遍历每一个半年周期
+for period_idx, (period_name, (start_date_str, end_date_str)) in enumerate(zip(PERIODS, HALF_YEAR_BOUNDARIES)):
+    print(f"\n--- 正在处理周期: {period_name} ({start_date_str} to {end_date_str}) ---")
+
+    # 1. 构建协方差 Excel 文件路径
+    covariance_file_path = os.path.join(COVARIANCE_PATH, f"{period_name}_协方差.xlsx")
+
+    if not os.path.exists(covariance_file_path):
+        print(f"   -> 警告: 缺少协方差文件: {covariance_file_path}，跳过。")
+        continue
+
+    # 2. 筛选 $\delta$ 和 $\omega$ 数据 (用于后续 20 交易日周期的计算)
+    start_date = pd.to_datetime(start_date_str)
+    end_date = pd.to_datetime(end_date_str)
+
+    # 筛选风险溢价数据
+    delta_period = delta_df.loc[start_date:end_date]
+    # 筛选市值数据
+    market_cap_period = market_cap_df.loc[start_date:end_date]
+
+    # 获取所有交易日（以市值数据为准）
+    all_dates_in_period = market_cap_period.index.unique()
+
+    # 3. 划分 20 个交易日的小周期
+    small_periods = split_into_20_day_periods(all_dates_in_period)
+    print(f"   -> 划分为 {len(small_periods)} 个 20-交易日小周期。")
+
+    # 4. 创建输出文件
+    output_filename = os.path.join(OUTPUT_DIR, f"{period_name}预期收益率.xlsx")
+
+    with pd.ExcelWriter(output_filename, engine='xlsxwriter') as writer:
+
+        # 遍历每一个 20-交易日小周期
+        for small_period_idx, (sp_start, sp_end) in enumerate(small_periods):
+            # sp_start 已经是 20 交易日周期的起始日期 (用于 delta 和 omega)
+
+            # 1. 确定 20 交易日小周期截止日期 (sp_end_str)，用于 $\bar{\delta}$, $\bar{\omega}$ 和 $\Sigma$ Sheet 的 'to'
+            if sp_end == all_dates_in_period[-1]:
+                # 最后一个周期，sp_end 就是最后一个日期
+                current_end_date = sp_end
+            else:
+                # 对于中间周期，sp_end 是下一个周期的开始日期，需要用其前一个日期作为截止日期
+                prev_index = all_dates_in_period.get_loc(sp_end)
+                current_end_date = all_dates_in_period[prev_index]
+
+            sp_end_str = (current_end_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+
+            # 2. **核心修正**: 计算 $\Sigma$ 矩阵的起始日期（回溯 180 天）
+            # 使用 pd.Timedelta(days=180) 来计算日历日
+            sigma_start_date = current_end_date - pd.Timedelta(days=180)
+            sigma_start_str = (sigma_start_date+ pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+
+            # 3. 构造 $\Sigma$ Sheet Name (基于 180 天窗口) 和 输出 Sheet Name (基于 20 交易日窗口)
+            # $\Sigma$ Sheet Name 使用 180 天回溯的起始日期
+            sigma_sheet_name = f"{sigma_start_str}_to_{sp_end_str}"
+            # 输出 Sheet Name 仍然使用 20 交易日周期的实际起止日期
+            output_sheet_name = f"{sp_start.strftime('%Y-%m-%d')}_to_{sp_end_str}"
+
+            print(f"      - 正在计算小周期 {small_period_idx + 1}: {output_sheet_name}")
+            print(f"        -> $\Sigma$ 矩阵 Sheet 名称: {sigma_sheet_name}")
+
+            # --- (0) 在小周期循环内，加载对应的 $\Sigma$ 矩阵 ---
+            try:
+                # 使用 sigma_sheet_name (即 180天计算窗口) 来读取对应的 $\Sigma$
+                sigma_matrix = pd.read_excel(covariance_file_path, sheet_name=sigma_sheet_name, index_col=0)
+                # 确保索引和列名都是字符串，方便对齐
+                sigma_matrix.columns = sigma_matrix.columns.astype(str)
+                sigma_matrix.index = sigma_matrix.index.astype(str)
+            except Exception as e:
+                # 警告级别提升，因为这直接影响计算
+                print(
+                    f"         -> !!! 严重警告: 无法加载协方差文件 {covariance_file_path} 中 sheet '{sigma_sheet_name}' 的 $\Sigma$: {e}，跳过计算。")
+                continue
+
+            # --- (a) 计算 $\bar{\delta}$ (风险溢价) 的均值 (使用 20 交易日窗口) ---
+            # 窗口：[sp_start, current_end_date]
+            delta_window = delta_period.loc[sp_start:current_end_date]
+            # 最终的 $\delta$ 是该周期内风险溢价的均值
+            delta_mean = delta_window['Risk_Premium'].mean()
+            print("风险溢价:",delta_mean)
+
+            # --- (b) 计算 $\bar{\omega}$ (平均权重向量) (使用 20 交易日窗口) ---
+            # 窗口：[sp_start, current_end_date]
+            mc_window = market_cap_period.loc[sp_start:current_end_date]
+
+            # 1. 计算每个交易日的权重（市值 / 总市值）
+            total_market_cap = mc_window.sum(axis=1)
+            weight_daily = mc_window.div(total_market_cap, axis=0)
+
+            # 2. 计算 20 天周期的平均权重
+            omega_vector = weight_daily.mean(axis=0)  # 得到 Series，index 是股票代码
+
+            # --- (c) 对齐数据 ---
+            # 以当前加载的 $\Sigma$ 的股票代码为基准进行对齐
+            common_stocks = sigma_matrix.index.intersection(omega_vector.index)
+
+            if common_stocks.empty:
+                print("         -> 警告: 协方差矩阵和权重向量没有共同的股票代码，跳过计算。")
+                continue
+
+            sigma_aligned = sigma_matrix.loc[common_stocks, common_stocks]
+            omega_aligned = omega_vector.loc[common_stocks]
+            omega_sum = omega_aligned.sum()
+            omega_aligned = omega_aligned / omega_sum
+
+            # --- (d) 矩阵乘法计算 $\Pi = \bar{\delta} \Sigma \bar{\omega}$ ---
+            # 1. $\Sigma \cdot \bar{\omega}$
+            product_sigma_omega = sigma_aligned @ omega_aligned
+
+            # 2. $\bar{\delta} \cdot (\Sigma \cdot \bar{\omega})$
+            result_pi = product_sigma_omega * delta_mean
+
+            # 转换为 DataFrame 格式
+            result_df = pd.DataFrame({
+                'Stock_Code': result_pi.index,
+                'Expected_Return': result_pi.values
+            })
+
+            # --- (e) 结果保存 ---
+            # 使用 20 交易日窗口的名称作为输出 Sheet 名称
+            result_df.to_excel(writer, sheet_name=output_sheet_name, index=False)
+
+print("\n--- 所有周期计算完成，结果已保存到以下目录和文件中 ---")
+for period_name in PERIODS:
+    print(f"-> {os.path.join(OUTPUT_DIR, f'{period_name}预期收益率.xlsx')}")
