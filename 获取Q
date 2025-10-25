@@ -1,0 +1,168 @@
+import pandas as pd
+import os
+import re
+from datetime import datetime
+
+# ----------------- 【请修改以下路径】 -----------------
+Q_folder_path = r"C:\Users\cufet\Desktop\Q"
+pai_folder_path = r"C:\Users\cufet\Desktop\先验均值pai"
+# 最终输出excel文件的完整路径
+output_file_path = r'C:\Users\cufet\Desktop\filtered_updated_returns.xlsx'
+
+
+# ------------------------------------------------------
+
+# 辅助函数：从文件名/Sheet名中提取截止日期（'to_'后面的日期）
+def extract_end_date(name):
+    """从 YYYY-MM-DD_to_YYYY-MM-DD 格式的字符串中提取第二个日期。"""
+    match = re.search(r'to[_\s](\d{4}-\d{2}-\d{2})', str(name), re.IGNORECASE)
+    if match: return match.group(1)
+    return None
+
+
+# --- 1. 读取并合并先验均值（构建 df_pai_initial 和 目标日期列表） ---
+
+list_df_pai = []
+# *** 新增：存储所有 pai sheet 中提取到的日期，作为最终筛选的依据 ***
+target_output_dates = set()
+
+try:
+    for filename in os.listdir(pai_folder_path):
+        if filename.endswith(('.xls', '.xlsx')):
+            full_path = os.path.join(pai_folder_path, filename)
+            xls = pd.ExcelFile(full_path)
+            for sheet_name in xls.sheet_names:
+                date_str = extract_end_date(sheet_name)
+
+                if date_str:
+                    # 收集目标日期（字符串格式）
+                    target_output_dates.add(date_str)
+                    # 将日期转换为 datetime 对象用于构建 df_pai_initial
+                    date_key = datetime.strptime(date_str, '%Y-%m-%d')
+                else:
+                    continue
+
+                df_pai_temp = pd.read_excel(xls, sheet_name=sheet_name)
+                if df_pai_temp.shape[1] < 2: continue
+
+                df_pai_temp.columns = ['股票代码', '预期收益_初始'] + list(df_pai_temp.columns[2:])
+                df_temp = df_pai_temp[['股票代码', '预期收益_初始']].copy()
+                df_temp['Date'] = date_key
+                df_temp = df_temp.dropna(subset=['股票代码', '预期收益_初始'])
+                list_df_pai.append(df_temp)
+
+    if not list_df_pai:
+        print(f"错误：在文件夹 {pai_folder_path} 中未找到任何包含有效日期的 Excel 数据。")
+        exit()
+
+    df_pai_all_history = pd.concat(list_df_pai, ignore_index=True)
+    df_pai_all_history['预期收益_初始'] = pd.to_numeric(df_pai_all_history['预期收益_初始'], errors='coerce')
+
+    # 找到每个股票代码的最新数据点 (按 'Date' 排序并去重，保留最新 'last')
+    df_pai_initial = (
+        df_pai_all_history.sort_values('Date')
+        .drop_duplicates(subset=['股票代码'], keep='last')
+        .set_index('股票代码')
+        [['预期收益_初始']]
+    )
+
+except Exception as e:
+    print(f"读取先验均值数据时发生错误: {e}")
+    exit()
+
+all_stocks = df_pai_initial.index.tolist()
+print("-" * 50)
+print(f"成功构建初始先验均值数据 (作为替换基准)，共 {len(df_pai_initial)} 个股票。")
+print(f"目标输出日期列表 (来自 pai folder): {sorted(list(target_output_dates))}")
+print("-" * 50)
+
+# 用于存储每日更新后的 DataFrame (key: 日期字符串, value: 更新后的 df)
+daily_updated_dataframes = {}
+
+# --- 2. 遍历Q folder，执行替换逻辑 (生成所有 Q 日期的更新结果) ---
+
+for filename in os.listdir(Q_folder_path):
+    if filename.endswith(('.xls', '.xlsx')):
+        full_path = os.path.join(Q_folder_path, filename)
+
+        print(f"正在处理 Q 文件: {filename}...")
+
+        try:
+            df_Q_raw = pd.read_excel(full_path, sheet_name=0)
+            date_col = df_Q_raw.columns[0]
+
+            # 宽格式转长格式
+            df_Q_long = df_Q_raw.melt(
+                id_vars=[date_col],
+                var_name='股票代码',
+                value_name='Q收益'
+            )
+
+            df_Q_long['Date'] = pd.to_datetime(df_Q_long[date_col])
+            df_Q_long['股票代码'] = df_Q_long['股票代码'].astype(str).str.strip()
+            df_Q_long = df_Q_long.drop(columns=[date_col]).dropna(subset=['Q收益'])
+
+            # 遍历 Q 数据中的每个交易日并执行替换
+            unique_dates_in_Q = sorted(df_Q_long['Date'].unique())
+
+            for date_in_Q in unique_dates_in_Q:
+                date_str = date_in_Q.strftime('%Y-%m-%d')
+
+                df_Q_daily = df_Q_long[df_Q_long['Date'] == date_in_Q]
+                series_Q_daily = df_Q_daily.set_index('股票代码')['Q收益']
+
+                # --- 执行替换逻辑 (Outer Merge) ---
+                df_updated = series_Q_daily.to_frame().rename(columns={'Q收益': '预期收益_更新'})
+
+                df_updated = df_updated.merge(
+                    df_pai_initial,
+                    left_index=True,
+                    right_index=True,
+                    how='outer'
+                )
+
+                # 填充逻辑：若 Q 收益为 NaN，则用初始 pai 收益填充
+                df_updated['预期收益_更新'] = df_updated['预期收益_更新'].fillna(df_updated['预期收益_初始'])
+
+                # 存储结果
+                daily_updated_dataframes[date_str] = df_updated[['预期收益_更新']].rename(
+                    columns={'预期收益_更新': '预期收益'})
+
+                # print(f"    - 完成日期 {date_str} 的更新和存储。") # 减少输出，加快速度
+
+        except Exception as e:
+            print(f"处理文件 {filename} 时发生错误: {e}")
+
+        # print("-" * 50) # 减少输出
+
+# --- 3. 组织结果并输出 Excel (筛选并输出目标日期) ---
+
+if not daily_updated_dataframes:
+    print("未成功处理任何 Q 文件中的日期数据，程序退出。")
+else:
+    # 筛选出需要输出的目标日期
+    output_dataframes = {}
+    for date_str in sorted(list(target_output_dates)):
+        if date_str in daily_updated_dataframes:
+            output_dataframes[date_str] = daily_updated_dataframes[date_str]
+        else:
+            print(f"警告：目标日期 {date_str} 无法在 Q 数据中找到对应的更新结果，跳过此日期。")
+
+    if not output_dataframes:
+        print("所有目标日期均未在 Q 数据中找到对应的更新结果，未生成文件。")
+        exit()
+
+    print("--- 正在生成最终文件 ---")
+
+    with pd.ExcelWriter(output_file_path, engine='xlsxwriter', datetime_format='yyyy-mm-dd') as writer:
+        for date_str in sorted(output_dataframes.keys()):
+            df_out = output_dataframes[date_str]
+
+            # 使用 reindex 保证每个 Sheet 的行顺序一致 (可选，但推荐)
+            df_out = df_out.reindex(sorted(df_out.index.tolist()))
+
+            df_out.to_excel(writer, sheet_name=date_str, float_format='%.8f')
+
+    print("=" * 50)
+    print(f"🎉 成功生成最终预期收益文件 (已按 pai 日期筛选): {output_file_path}")
+    print(f"总共生成了 {len(output_dataframes)} 个 Sheet。")
