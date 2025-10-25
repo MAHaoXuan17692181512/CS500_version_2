@@ -1,0 +1,509 @@
+import pandas as pd
+import numpy as np
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Callable
+import os
+import joblib
+import matplotlib
+
+matplotlib.use('TkAgg')  # 保留您的TkAgg设置
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
+matplotlib.rcParams['axes.unicode_minus'] = False
+warnings.filterwarnings('ignore')
+
+try:
+    import xgboost as xgb
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import mean_squared_error
+except ImportError:
+    warnings.warn("XGBoost/scikit-learn 库未安装。模型训练功能将无法使用。")
+
+warnings.filterwarnings('ignore')
+
+FACTOR_FILE_EXTENSIONS = ['*.csv', '*.xlsx', '*.xls']
+
+
+class XGBOOSTAnalyzer:
+
+    def __init__(self, data_folder: str):
+        self.data_folder = Path(data_folder)
+        self.all_data = {}
+        # self.synthetic_factors 存储加载进来的因子宽表数据: {factor_name: pd.DataFrame}
+        self.synthetic_factors = {}
+        self.model = None
+        # 训练集需要价格数据来计算未来收益Y，所以保留这些字段
+        self.all_data['daily_close_return'] = None
+        self.all_data['daily_open_return'] = None
+        self.all_data['future_return_20d'] = None
+
+    def validate_date_alignment(self, X_combined: pd.DataFrame, y_series: pd.Series) -> bool:
+        """
+        验证特征X和目标Y的日期对齐情况
+        """
+        print(f"\n📅 正在验证日期对齐情况...")
+
+        # 获取X和Y的日期集合
+        X_dates = set(X_combined.index.get_level_values('date'))
+        y_dates = set(y_series.index.get_level_values('date'))
+
+        print(f"  特征X日期范围: {min(X_dates)} 到 {max(X_dates)}")
+        print(f"  目标Y日期范围: {min(y_dates)} 到 {max(y_dates)}")
+        print(f"  特征X唯一日期数: {len(X_dates)}")
+        print(f"  目标Y唯一日期数: {len(y_dates)}")
+
+        # 计算重叠情况
+        overlap_dates = X_dates & y_dates
+        overlap_ratio = len(overlap_dates) / min(len(X_dates), len(y_dates)) if min(len(X_dates),
+                                                                                    len(y_dates)) > 0 else 0
+
+        print(f"  重叠日期数: {len(overlap_dates)}")
+        print(f"  日期重叠度: {overlap_ratio:.2%}")
+
+        if overlap_ratio == 0:
+            print("❌ 严重错误：特征和目标变量日期完全无重叠！")
+            return False
+        elif overlap_ratio < 0.5:
+            print("⚠️ 警告：特征和目标变量日期重叠度较低 (<50%)")
+            return True
+        else:
+            print("✅ 日期对齐验证通过")
+            return True
+
+    # --- parse_dirty_wide_table 和 load_all_periods 保持不变 ---
+    def parse_dirty_wide_table(self, raw_data: pd.DataFrame, sheet_name: str = None) -> pd.DataFrame:
+        try:
+            data = raw_data.copy()
+            data.columns = data.iloc[0].values
+            clean_data = data.iloc[2:].copy()
+            time_col_name = clean_data.columns[0]
+            clean_data = clean_data.set_index(time_col_name)
+            cleaned_index = [val if not isinstance(val, tuple) else pd.NaT for val in clean_data.index]
+            clean_data.index = pd.Index(cleaned_index)
+            clean_data.index = pd.to_datetime(clean_data.index)
+            clean_data = clean_data.apply(pd.to_numeric, errors='coerce')
+            clean_data = clean_data.dropna(axis=1, how='all')
+            clean_data = clean_data.replace(0, np.nan)
+            clean_data = clean_data.fillna(method='ffill')
+            clean_data.columns.name = 'code'
+            clean_data.index.name = 'date'
+            return clean_data
+        except Exception as e:
+            print(f"❌ 解析 {sheet_name} 失败: {e}")
+            raise
+
+    def load_all_periods(self):
+        excel_files = sorted(
+            list(self.data_folder.glob("中证500_*.xlsx")) +
+            list(self.data_folder.glob("中证500_*.xls"))
+        )
+        if not excel_files:
+            # 对于测试集，可能不需要价格数据，所以这个警告可以接受
+            print(f"⚠️ 未找到本地价格 Excel 文件。")
+            return
+        print(f"找到 {len(excel_files)} 个数据文件")
+        all_close_prices = []
+        all_open_prices = []
+        for file in excel_files:
+            period_name = file.stem.replace("中证500_", "")
+            try:
+                xl_file = pd.ExcelFile(file)
+                period_data = {}
+                for sheet_name in xl_file.sheet_names:
+                    if sheet_name != 'Sheet1':
+                        sheet_data = pd.read_excel(file, sheet_name=sheet_name, header=None)
+                        try:
+                            parsed_data = self.parse_dirty_wide_table(sheet_data, sheet_name)
+                            if not parsed_data.empty: period_data[sheet_name] = parsed_data
+                        except Exception:
+                            continue
+                self.all_data[period_name] = period_data
+                if '收盘价' in period_data: all_close_prices.append(period_data['收盘价'])
+                if '开盘价' in period_data: all_open_prices.append(period_data['开盘价'])
+            except Exception as e:
+                print(f"❌ 加载文件 {file.name} 失败: {e}")
+
+        if all_close_prices:
+            all_close_prices_df = pd.concat(all_close_prices).sort_index()
+            self.all_data['daily_close_return'] = all_close_prices_df.pct_change().stack().rename('daily_return')
+            print("📈 已合并所有日收盘收益率。")
+
+        if all_open_prices:
+            all_open_prices_df = pd.concat(all_open_prices).sort_index()
+            daily_open_return_df = all_open_prices_df.pct_change()
+            self.all_data['daily_open_return'] = daily_open_return_df.stack().rename('daily_return')
+
+            past_cum_return_20d = daily_open_return_df.apply(
+                lambda col: col.rolling(window=20).apply(lambda x: np.prod(1 + x) - 1, raw=True)
+            )
+            future_return_20d = past_cum_return_20d.shift(-20)
+            self.all_data['future_return_20d'] = future_return_20d.stack().rename('future_return')
+            print("✅ 20 日滚动未来收益目标 (Y) 已计算并存储。")
+
+        # 保证 _display_data_overview 存在
+        if hasattr(self, '_display_data_overview') and self.all_data:
+            self._display_data_overview()
+
+    def _display_data_overview(self):
+        print(f"\n{'=' * 60}")
+        print("数据加载概览")
+        print(f"{'=' * 60}")
+        # 仅显示加载的数据项
+        for period_name, period_data in self.all_data.items():
+            if isinstance(period_data, dict):
+                print(f"\n📅 时间段: {period_name} - 包含 {len(period_data)} 个数据表")
+
+    # --- load_precalculated_factors 保持不变 ---
+    def load_precalculated_factors(self, factor_folder: str):
+        """从指定文件夹加载预计算的因子数据 (Date Index, Code Columns 的宽表)"""
+        # 注意：这里我们使用 self.data_folder 来查找文件，如果 factor_folder 是一个独立的路径，
+        # 应该修改成使用 factor_folder.glob(ext)
+        folder = Path(factor_folder)  # 使用传入的因子路径
+        factor_files = []
+        for ext in FACTOR_FILE_EXTENSIONS:
+            factor_files.extend(list(folder.glob(ext)))
+        # ... (与原始实现相同，省略) ...
+        # (保留 load_precalculated_factors 的原始实现)
+
+        # 简化后的 load_precalculated_factors，假设它使用 self.data_folder 来查找因子文件：
+
+        # 为了兼容性，我们直接使用传入的 factor_folder 作为查找路径
+        folder = Path(factor_folder)
+        factor_files = []
+        for ext in FACTOR_FILE_EXTENSIONS:
+            # 查找所有匹配的文件
+            factor_files.extend(list(folder.glob(ext)))
+
+        factor_files = [f for f in factor_files if f.stem not in ['summary', 'readme']]  # 简单过滤
+
+        if not factor_files:
+            print(f"⚠️ 在路径 {factor_folder} 中未找到任何因子文件。")
+            return
+
+        print(f"\n找到 {len(factor_files)} 个预计算因子文件，开始加载...")
+        self.synthetic_factors = {}
+
+        for file in factor_files:
+            factor_name = file.stem.replace('_panel_data', '').replace('_WIDE_DATA', '')  # 清理因子名
+
+            try:
+                if file.suffix in ['.xlsx', '.xls']:
+                    factor_df = pd.read_excel(file)
+                elif file.suffix == '.csv':
+                    factor_df = pd.read_csv(file)
+                else:
+                    continue
+
+                if factor_df.empty: continue
+
+                # 尝试将长表 (Panel Data) 转换为宽表 (Wide Data)
+                if 'date' in factor_df.columns and 'code' in factor_df.columns:
+                    if factor_name not in factor_df.columns:
+                        value_col = [col for col in factor_df.columns if col not in ['date', 'code']][0]
+                        factor_df = factor_df.rename(columns={value_col: factor_name})
+                    factor_df = factor_df.drop_duplicates(subset=['date', 'code'], keep='first')
+                    factor_df = factor_df.pivot(index='date', columns='code', values=factor_name)
+                    factor_df.index = pd.to_datetime(factor_df.index)
+                    factor_df.columns = factor_df.columns.astype(str)
+                else:
+                    # 假设已经是宽表格式，第一列是日期索引
+                    factor_df = pd.read_excel(file, index_col=0) if file.suffix in ['.xlsx', '.xls'] else pd.read_csv(
+                        file, index_col=0)
+                    factor_df.index = pd.to_datetime(factor_df.index)
+                    factor_df.columns = factor_df.columns.astype(str)
+
+                # 最后清理
+                factor_df = factor_df.apply(pd.to_numeric, errors='coerce')
+                factor_df = factor_df.dropna(axis=1, how='all')
+                factor_df.columns.name = 'code'
+                factor_df.index.name = 'date'
+
+                self.synthetic_factors[factor_name] = factor_df
+                print(f"    ✅ 加载并转换为宽表因子: {factor_name} (Shape: {factor_df.shape})")
+
+            except Exception as e:
+                print(f"❌ 加载文件 {file.name} 失败: {e}")
+                continue
+
+    def prepare_xgboost_data(self, lookback_days: int = 20, predict_days: int = 20) -> Optional[pd.DataFrame]:
+        """
+        核心数据准备逻辑，用于计算 X (滚动均值) 并与 Y (未来收益) 合并。
+        对于测试集，如果 Y 不存在，它会尝试使用一个空占位符来生成 X。
+        """
+        print(f"\n⚙️ 正在准备 XGBoost 数据集 (X: 过去 {lookback_days} 天平均, Y: 未来 {predict_days} 天收益)...")
+
+        y_series = self.all_data.get('future_return_20d')
+        is_training_set = y_series is not None and not y_series.empty
+
+        if not self.synthetic_factors:
+            print("❌ 错误：因子数据缺失。请检查加载是否成功。")
+            return None
+
+        factor_dfs = []
+
+        # 1. 对每个因子进行 lookback_days (20天) 滚动均值计算
+        for factor_name, wide_factor_df in self.synthetic_factors.items():
+            X_df_rolled = wide_factor_df.apply(
+                lambda col: col.rolling(window=lookback_days, min_periods=1).mean()
+            )
+            X_df_feature = X_df_rolled.shift(1)
+            X_series_feature = X_df_feature.stack().rename(factor_name)
+            factor_dfs.append(X_series_feature)
+
+        # 2. 合并所有滚动后的因子特征 (X)
+        X_combined = pd.concat(factor_dfs, axis=1)
+        X_combined.index.names = ['date', 'code']  # 确保 MultiIndex 名称正确
+        X_combined = X_combined.fillna(0)
+
+        if is_training_set:
+            # 3a. 训练集：合并特征 X 和目标 Y (内连接对齐)
+            if not self.validate_date_alignment(X_combined, y_series):
+                print("❌ 日期对齐验证失败，无法继续训练")
+                return None
+
+            combined_df = X_combined.join(y_series, how='inner')
+            combined_df.dropna(subset=['future_return'], inplace=True)
+            # combined_df.dropna(inplace=True)
+            print(f"✅ 训练集数据准备完成。总样本数: {len(combined_df)}")
+        else:
+            # 3b. 测试集：只保留特征 X
+            combined_df = X_combined.dropna()
+            print(f"✅ 测试集特征准备完成。总样本数: {len(combined_df)}")
+
+        return combined_df.reset_index(names=['date', 'code'])
+
+    # train_xgboost_model 保持原样，但 main 函数中将跳过它
+    def train_xgboost_model(self, data_df: pd.DataFrame, model_path: str = 'XGBOOST_20Day_Factor_Model.json'):
+        print("\n🧠 正在训练 XGBoost 模型 ...")
+        X = data_df.drop(columns=['date', 'code', 'future_return'])
+        y = data_df['future_return']
+        if X.empty:
+            print("❌ 训练数据集为空。")
+            return
+        try:
+            model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1, max_depth=5,
+                                     random_state=42, n_jobs=-1)
+            # X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=True)
+            model.fit(X, y)
+            y_pred = model.predict(X)
+            mse = mean_squared_error(y, y_pred)
+            rmse = np.sqrt(mse)
+            print(f"✅ 模型训练完成。测试集 RMSE: {rmse:.4f}")
+            self.model = model
+        except NameError:
+            print("⚠️ XGBoost 库未安装，跳过模型训练。")
+        except Exception as e:
+            print(f"❌ 模型训练失败: {e}")
+
+
+# ====================================================================
+# 【新增】用于处理测试集因子的预测器类
+# ====================================================================
+
+class XGBoostPredictor(XGBOOSTAnalyzer):
+    """
+    专为测试集预测设计，继承自 Analyzer，用于加载测试集因子的特征数据 X。
+    """
+
+    def __init__(self, test_folder: str):
+        super().__init__(data_folder=test_folder)  # data_folder 指向 test_folder
+
+    def load_test_factors_only(self):
+        """只加载测试集的因子文件。"""
+        # test_folder 现在就是因子所在的路径
+        super().load_precalculated_factors(factor_folder=str(self.data_folder))
+
+        # 覆盖父类的 prepare_xgboost_data，但由于父类已经修改，我们可以直接调用它
+
+    def prepare_test_data(self, lookback_days: int = 20, predict_days: int = 20) -> Optional[pd.DataFrame]:
+        """
+        准备测试集特征数据 X。
+        """
+        # 父类 prepare_xgboost_data 现在可以处理 self.all_data['future_return_20d'] 为空的情况
+        return super().prepare_xgboost_data(lookback_days=lookback_days, predict_days=predict_days)
+
+
+# plot_feature_importance 函数保持不变
+def plot_feature_importance(
+        model: xgb.XGBRegressor,
+        feature_names: List[str],
+        importance_type: str = 'gain',
+        top_n: int = 15
+):
+    # ... (与之前提供的实现相同) ...
+    print(f"\n--- 📈 变量贡献度分析 (基于 {importance_type.upper()}) ---")
+
+    try:
+        importance_scores = model.get_booster().get_score(
+            importance_type=importance_type
+        )
+    except xgb.core.XGBoostError as e:
+        print(f"❌ 获取重要性得分失败，请确认模型已训练：{e}")
+        return
+
+    importance_df = pd.DataFrame(
+        list(importance_scores.items()),
+        columns=['Feature', f'Importance_{importance_type.capitalize()}']
+    )
+
+    if all(name.startswith('f') and name[1:].isdigit() for name in importance_df['Feature']):
+        name_map = {f'f{i}': name for i, name in enumerate(feature_names)}
+        importance_df['Feature'] = importance_df['Feature'].map(name_map).fillna(importance_df['Feature'])
+
+    importance_df = importance_df.sort_values(
+        by=f'Importance_{importance_type.capitalize()}',
+        ascending=False
+    ).head(top_n)
+
+    print(importance_df)
+
+    plt.figure(figsize=(10, 6))
+    sns.barplot(
+        x=f'Importance_{importance_type.capitalize()}',
+        y='Feature',
+        data=importance_df,
+        palette='viridis'
+    )
+    plt.title(f'XGBoost 变量贡献度 ({importance_type.capitalize()}) - Top {top_n}', fontsize=14)
+    plt.xlabel(f'贡献度 ({importance_type.capitalize()})', fontsize=12)
+    plt.ylabel('变量', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+
+# ====================================================================
+#                          程序执行块 (Main)
+# ====================================================================
+
+def main():
+    # 路径配置
+    raw_data_folder = "C:/Users/cufet/Desktop/训练集"
+    test_folder = 'C:/Users/cufet/Desktop/测试集'  # 包含测试日因子文件的路径
+    factor_folder_path = "C:/Users/cufet/Desktop/Factor_Analysis_Output"
+    OUTPUT_EXCEL_PATH = "C:/Users/cufet/Desktop/XGBoost_Test_Predictions.xlsx"  # 输出文件名改为 Test_Predictions
+
+    # -----------------------------------------------------------
+    #                       训练阶段
+    # -----------------------------------------------------------
+    analyzer = XGBOOSTAnalyzer(data_folder=raw_data_folder)
+
+    # 1. 加载训练集价格数据 (用于计算 Y)
+    analyzer.load_all_periods()
+
+    # 2. 加载训练集因子宽表数据 (用于计算 X)
+    analyzer.load_precalculated_factors(factor_folder_path)
+
+    # 3. 准备 XGBoost 训练集 (X + Y)
+    lookback_days = 20
+    predict_days = 20
+    xgboost_data = analyzer.prepare_xgboost_data(lookback_days=lookback_days, predict_days=predict_days)
+
+    if xgboost_data is None or xgboost_data.empty:
+        print("❌ 训练数据集准备失败，无法进行模型训练。")
+        return
+
+    # 4. 训练模型 (使用全部训练数据拟合，跳过 train_test_split 划分)
+    X_train_all = xgboost_data.drop(columns=['date', 'code', 'future_return'])
+    y_train_all = xgboost_data['future_return']
+    X_features = X_train_all.columns.tolist()
+
+    print("\n🧠 正在使用全部训练集数据训练 XGBoost 模型...")
+
+    try:
+        model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1, max_depth=5,
+                                 random_state=42, n_jobs=-1)
+        model.fit(X_train_all, y_train_all)
+        analyzer.model = model
+        y_pred_train = analyzer.model.predict(X_train_all)
+        rmse_train = np.sqrt(mean_squared_error(y_train_all, y_pred_train))
+        print(f"✅ 模型训练/拟合完成。**训练集** RMSE: {rmse_train:.4f}")
+    except Exception as e:
+        print(f"❌ 模型训练失败: {e}")
+        return
+
+    # 5. 进行变量贡献度分析和可视化 (使用训练好的模型)
+    plot_feature_importance(
+        model=analyzer.model,
+        feature_names=X_features,
+        importance_type='gain',
+        top_n=15
+    )
+
+    # -----------------------------------------------------------
+    #                       预测阶段：在测试集上进行预测
+    # -----------------------------------------------------------
+    if analyzer.model is not None:
+
+        # 1. 实例化预测器，指向测试集因子文件夹
+        predictor = XGBoostPredictor(test_folder=test_folder)
+
+        # 2. 加载测试集因子数据
+        predictor.load_test_factors_only()
+
+        # 3. 准备测试集的特征 X (注意：这里 Y 缺失，prepare_xgboost_data 只会返回 X)
+        test_X_df_with_index = predictor.prepare_test_data(lookback_days=lookback_days, predict_days=predict_days)
+
+        if test_X_df_with_index is None or test_X_df_with_index.empty:
+            print("❌ 测试集特征准备失败或数据为空，跳过预测。")
+            return
+
+        # 分离索引和特征矩阵
+        test_index_df = test_X_df_with_index[['date', 'code']].copy()
+        test_X_matrix = test_X_df_with_index.drop(columns=['date', 'code'])
+
+        # 4. 确保测试集特征顺序与训练集一致 (这是关键步骤！)
+        try:
+            test_X_matrix = test_X_matrix[X_features]
+        except KeyError as e:
+            print(f"❌ 错误：测试集因子与训练集因子不匹配。缺失特征: {e}")
+            return
+
+        # 5. 进行预测
+        print("\n--- 🚀 正在对测试集进行预测 ---")
+        y_pred_test = analyzer.model.predict(test_X_matrix)
+
+        # 6. 构建预测结果 DataFrame
+        test_results_df = test_index_df.copy()  # 包含 date 和 code
+
+        # 确保预测值和索引长度匹配 (保持不变)
+        if len(y_pred_test) != len(test_results_df):
+            # ... (错误处理) ...
+            return
+        test_results_df['Predicted_Return'] = y_pred_test
+        # 🌟🌟 核心修改：透视并重置索引 🌟🌟
+        try:
+            wide_results_df = test_results_df.pivot(
+                index='date',
+                columns='code',
+                values='Predicted_Return'
+            )
+
+            # 🌟🌟 最终修复点：强制清除列索引名称 'code' 🌟🌟
+            # 1. 确保列名（股票代码）是字符串
+            wide_results_df.columns = wide_results_df.columns.astype(str)
+
+            # 2. 【最关键】彻底移除列索引名称，这是导致冲突的根源
+            wide_results_df.columns.name = None
+
+            # 3. 确保行索引名称 'date' 被保留 (可选，但推荐保留清晰性)
+            wide_results_df.index.name = 'date'
+
+        except KeyError as e:
+            print(f"❌ 关键列 '{e}' 缺失。请检查 y_pred_test 是否为空或长度不匹配。")
+            return
+        # 7. 导出到 Excel
+        try:
+            wide_results_df.to_excel(OUTPUT_EXCEL_PATH)
+            print(f"✅ **测试集**预测结果（宽表，包含日期）已成功导出到: {OUTPUT_EXCEL_PATH}")
+            print(f"   导出样本总数: {len(wide_results_df.stack().dropna())} / 日期数: {len(wide_results_df)}")
+        except Exception as e:
+            print(f"❌ 导出测试集 Excel 失败: {e}")
+
+    print("\n🎉 数据准备与预测流程执行完毕。")
+
+
+if __name__ == "__main__":
+    main()
