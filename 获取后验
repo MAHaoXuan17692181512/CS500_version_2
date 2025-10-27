@@ -1,0 +1,277 @@
+import pandas as pd
+import numpy as np  # <<< 新增：引入 numpy
+import os
+import re
+from datetime import datetime
+from numpy.linalg import inv, LinAlgError  # <<< 引入求逆函数
+from numpy.linalg import pinv, LinAlgError
+# ----------------- 【请修改以下路径】 -----------------
+# 收益率数据（Q和先验收益）的来源文件路径
+returns_file_path = r"C:\Users\cufet\Desktop\filtered_updated_returns.xlsx"
+# 协方差矩阵文件夹路径
+covariance_folder_path = r"C:\Users\cufet\Desktop\协方差"
+# 最终输出 Excel 文件的完整路径
+output_combined_file_path = r'C:\Users\cufet\Desktop\combined_bayesian_results.xlsx'
+# ------------------------------------------------------
+
+# >>>>>> Black-Litterman 模型参数设置 <<<<<<
+TAU = 0.025  # 权重不确定性因子 (标量，需根据模型设定)
+
+# 辅助函数：从协方差文件名/Sheet名中提取截止日期（'to_'后面的日期）
+def extract_end_date_from_name(name):
+    """从 YYYY-MM-DD_to_YYYY-MM-DD 格式的字符串中提取第二个日期。"""
+    match = re.search(r'to[_\s](\d{4}-\d{2}-\d{2})', str(name), re.IGNORECASE)
+    if match: return match.group(1)
+    return None
+
+
+# --- 1. 读取并处理协方差数据 (保持不变，已修正文件名问题) ---
+# covariance_data = {}
+# print("--- 1. 正在读取和处理协方差数据 ---")
+# try:
+#     for filename in os.listdir(covariance_folder_path):
+#         if filename.endswith(('.xls', '.xlsx')):
+#             full_path = os.path.join(covariance_folder_path, filename)
+#             xls = pd.ExcelFile(full_path)
+#
+#             if not xls.sheet_names:
+#                 print(f"警告: 文件 {filename} 中不包含任何 Sheet，跳过。")
+#                 continue
+#
+#             sheet_name_to_read = xls.sheet_names[0]
+#             date_str = extract_end_date_from_name(sheet_name_to_read)
+#
+#             if not date_str:
+#                 print(f"警告: 文件 {filename} 的第一个 Sheet 名称 '{sheet_name_to_read}' 格式不符合要求，跳过。")
+#                 continue
+#
+#             df_cov = pd.read_excel(xls, sheet_name=sheet_name_to_read, index_col=0)
+#
+#             df_cov.columns = df_cov.columns.astype(str).str.strip()
+#             df_cov.index = df_cov.index.astype(str).str.strip()
+#
+#             covariance_data[date_str] = df_cov
+#             print(f"  - 成功读取协方差数据，日期: {date_str}，文件: {filename}，维度: {df_cov.shape}")
+#
+# except Exception as e:
+#     print(f"读取协方差数据时发生致命错误: {e}")
+#     exit()
+#
+# if not covariance_data:
+#     print("错误：未成功读取任何协方差数据。程序退出。")
+#     exit()
+# --- 1. 读取并处理协方差数据 (已修正为读取所有 Sheet) ---
+covariance_data = {}
+print("--- 1. 正在读取和处理协方差数据 ---")
+try:
+    for filename in os.listdir(covariance_folder_path):
+        if filename.endswith(('.xls', '.xlsx')):
+            full_path = os.path.join(covariance_folder_path, filename)
+
+            # 打开 Excel 文件
+            xls = pd.ExcelFile(full_path)
+
+            if not xls.sheet_names:
+                print(f"警告: 文件 {filename} 中不包含任何 Sheet，跳过。")
+                continue
+
+            # >>>>>> 关键修改：遍历文件中的所有 Sheet <<<<<<
+            for sheet_name_to_read in xls.sheet_names:
+
+                # 从 Sheet 名称中提取截止日期作为 Key
+                date_str = extract_end_date_from_name(sheet_name_to_read)
+
+                if not date_str:
+                    print(f"警告: 文件 {filename} 中的 Sheet 名称 '{sheet_name_to_read}' 格式不符合要求，跳过此 Sheet。")
+                    continue
+
+                # 读取协方差矩阵
+                df_cov = pd.read_excel(xls, sheet_name=sheet_name_to_read, index_col=0)
+
+                df_cov.columns = df_cov.columns.astype(str).str.strip()
+                df_cov.index = df_cov.index.astype(str).str.strip()
+
+                # 存储数据
+                if date_str in covariance_data:
+                    # 可选：如果不同文件或 Sheet 包含相同日期，发出警告
+                    print(
+                        f"警告: 日期 {date_str} 的协方差数据已存在，将被当前文件 {filename} 的 Sheet '{sheet_name_to_read}' 覆盖。")
+
+                covariance_data[date_str] = df_cov
+                print(
+                    f"  - 成功读取协方差数据，日期: {date_str}，文件: {filename}，Sheet: {sheet_name_to_read}，维度: {df_cov.shape}")
+            # >>>>>> 关键修改结束 <<<<<<
+
+except Exception as e:
+    print(f"读取协方差数据时发生致命错误: {e}")
+    exit()
+
+if not covariance_data:
+    print("错误：未成功读取任何协方差数据。程序退出。")
+    exit()
+# --- 2. 读取 Q 和 先验收益数据 (保持不变) ---
+returns_data = {}
+print("\n--- 2. 正在读取 Q 和先验收益数据 ---")
+try:
+    xls = pd.ExcelFile(returns_file_path)
+    for sheet_name in xls.sheet_names:
+        date_str = sheet_name.strip()
+        try:
+            datetime.strptime(date_str, '%Y-%m-%d')
+        except ValueError:
+            print(f"警告: 收益文件中的 Sheet 名称 '{sheet_name}' 不是有效的日期格式，跳过。")
+            continue
+
+        df_returns = pd.read_excel(xls, sheet_name=sheet_name, index_col=0)
+        df_returns.index.name = '股票代码'
+
+        if 'Q' in df_returns.columns and '先验收益' in df_returns.columns:
+            returns_data[date_str] = df_returns[['Q', '先验收益']]
+            print(f"  - 成功读取收益数据，日期: {date_str}，股票数: {len(df_returns)}")
+        else:
+            print(f"警告: Sheet '{sheet_name}' 缺少 'Q' 或 '先验收益' 列，跳过。")
+
+except FileNotFoundError:
+    print(f"错误：未找到收益文件: {returns_file_path}。请检查路径。")
+    exit()
+except Exception as e:
+    print(f"读取收益数据时发生致命错误: {e}")
+    exit()
+
+if not returns_data:
+    print("错误：未成功读取任何收益数据。程序退出。")
+    exit()
+
+
+# ----------------- 【请修改以下路径】 -----------------
+# ... (路径部分保持不变) ...
+returns_file_path = r"C:\Users\cufet\Desktop\filtered_updated_returns.xlsx"
+covariance_folder_path = r"C:\Users\cufet\Desktop\协方差"
+output_combined_file_path = r'C:\Users\cufet\Desktop\BL后验结果.xlsx'
+# ------------------------------------------------------
+
+# >>>>>> Black-Litterman 模型参数设置 <<<<<<
+TAU = 0.025  # 权重不确定性因子 (标量，需根据模型设定)
+# ------------------------------------------------------
+
+# ... (辅助函数、第 1 步和第 2 步代码保持不变) ...
+
+# --- 3. 整合数据、执行 Black-Litterman 运算并输出 Excel ---
+print("\n--- 3. 正在整合数据、执行 Black-Litterman 运算并输出 Excel ---")
+
+common_dates = sorted(list(set(returns_data.keys()) & set(covariance_data.keys())))
+
+# ... (错误检查代码保持不变) ...
+with pd.ExcelWriter(output_combined_file_path, engine='xlsxwriter') as writer:
+    for date_str in common_dates:
+        df_returns = returns_data[date_str]
+        df_cov = covariance_data[date_str]
+
+        # --- 数据对齐 ---
+        stock_index_returns = df_returns.index.tolist()
+        stock_index_cov = df_cov.index.tolist()
+        common_stocks = sorted(list(set(stock_index_returns) & set(stock_index_cov)))
+
+        if not common_stocks:
+            print(f"警告: 日期 {date_str} 的收益和协方差数据中没有共同的股票代码，跳过此日期。")
+            continue
+
+        # 对齐收益数据
+        df_returns_aligned = df_returns.reindex(common_stocks)
+        # 对齐协方差矩阵
+        df_cov_aligned = df_cov.reindex(index=common_stocks, columns=common_stocks)
+
+        # 1. 转换为 Numpy 数组进行矩阵运算
+        Sigma = df_cov_aligned.values
+        Pi = df_returns_aligned['先验收益'].values.reshape(-1, 1)  # N x 1 向量 (先验均值)
+        Q = df_returns_aligned['Q'].values.reshape(-1, 1)  # N x 1 向量 (观点收益)
+        N = len(common_stocks)
+
+        # 2. 构造 P 和 Omega
+        # P 矩阵 (假设：N x N 单位矩阵，即每个股票都有一个独立观点)
+        P = np.identity(N)
+
+        try:
+            # Sigma 逆矩阵 (改为伪逆)
+            Sigma_inv = pinv(Sigma)
+
+            # Omega 矩阵: 使用简化公式 Omega = diag(P * (tau * Sigma) * P^T)
+            Omega_diag_elements = np.diag(P @ (TAU * Sigma) @ P.T)
+            Omega = np.diag(Omega_diag_elements)
+
+            # Omega 逆矩阵 (改为伪逆)
+            Omega_inv = pinv(Omega)
+
+            # --- 执行完整的 Black-Litterman 公式 ---
+
+            # 核心项 A = (tau * Sigma^-1 + P^T * Omega^-1 * P)^-1
+            # 这一项就是后验协方差 Sigma_p
+            A_matrix_inv = (TAU * Sigma_inv) + P.T @ Omega_inv @ P
+            Sigma_p_np = pinv(A_matrix_inv)  # 后验协方差
+
+            # 使用您定义的最终协方差矩阵
+            Sigma_p_np_end = Sigma_p_np + Sigma
+
+            # 核心项 B = (tau * Sigma^-1) * Pi + P^T * Omega^-1 * Q
+            B_vector = (TAU * Sigma_inv) @ Pi + P.T @ Omega_inv @ Q
+
+            # 后验均值 Mu_bar = Sigma_p * B
+            Mu_bar_np = Sigma_p_np @ B_vector
+
+            # 3. 转换为 DataFrame 准备输出
+            df_mu_bar = pd.DataFrame(Mu_bar_np, index=common_stocks, columns=['后验收益_MuBar'])
+            # df_Sigma_p 用于输出最终的协方差矩阵
+            df_Sigma_p = pd.DataFrame(Sigma_p_np_end, index=common_stocks, columns=common_stocks)
+
+            print(f"  - 日期 {date_str}: 成功计算 Black-Litterman 后验均值和协方差。")
+
+        except LinAlgError:
+            # 尽管使用了 pinv，但如果输入矩阵有严重的数值问题，仍然可能失败
+            print(f"错误: 日期 {date_str} 的矩阵运算失败 (可能由于严重数值问题)，跳过。")
+            continue
+
+        # --- 数据输出 ---
+
+        # Sheet 1: Black-Litterman 结果 (Mu_bar, Q, 先验收益)
+        sheet_name_results = f"{date_str}_Results"
+
+        # 1. 输出后验收益均值 (Mu_bar)
+        df_mu_bar.to_excel(writer, sheet_name=sheet_name_results, startrow=0, startcol=0, float_format='%.8f')
+
+        # 2. 输出原始的 Q 和先验收益，放在右侧
+        df_returns_aligned[['Q', '先验收益']].to_excel(writer, sheet_name=sheet_name_results, startrow=0,
+                                                       startcol=df_mu_bar.shape[1] + 2, float_format='%.8f')
+
+        print(f"  - 完成结果 Sheet: {sheet_name_results}")
+
+        # >>>>>> 最小化修改 1 & 2：单独输出协方差矩阵 <<<<<<
+
+        # Sheet 2: 协方差矩阵
+        sheet_name_cov = date_str  # 命名为日期
+
+        # 输出协方差矩阵
+        df_Sigma_p.to_excel(writer, sheet_name=sheet_name_cov, startrow=0, startcol=0, float_format='%.8f')
+
+        print(f"  - 完成协方差 Sheet: {sheet_name_cov}")
+
+        # 移除原有的在 _Results Sheet 中输出协方差的全部代码
+        # start_row_cov = df_mu_bar.shape[0] + 3
+        # workbook = writer.book
+        # worksheet = writer.sheets[sheet_name]
+        # try:
+        #     worksheet.write(start_row_cov - 2, 0, '后验协方差 Sigma_p:')
+        # except:
+        #     pass
+        # df_Sigma_p.to_excel(writer, sheet_name=sheet_name, startrow=start_row_cov, startcol=0, float_format='%.8f')
+        # >>>>>> 最小化修改结束 <<<<<<
+
+print("\n" + "=" * 50)
+print(f"🎉 最终 Black-Litterman 结果文件生成成功: {output_combined_file_path}")
+print(f"总共生成了 {2 * len(common_dates)} 个 Sheet (每个日期两个 Sheet)。")
+print("=" * 50)
+
+# 明确修改了哪里：
+# 1. 将原有的数据输出逻辑分为两个部分，分别对应两个 Sheet。
+# 2. 第一个 Sheet 命名为 f"{date_str}_Results" (包含 Mu_bar, Q, 先验收益)。
+# 3. 新增第二个 Sheet，命名为 date_str (包含 df_Sigma_p，即最终后验协方差)。
+# 4. 移除了在 f"{date_str}_Results" Sheet 中输出协方差矩阵及其标题的代码。
