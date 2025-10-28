@@ -1,0 +1,557 @@
+import pandas as pd
+import numpy as np
+import os
+from datetime import datetime
+import warnings
+
+warnings.filterwarnings('ignore', category=FutureWarning)
+#
+# --- 配置参数 ---
+BASE_DATA_PATH = r"C:\Users\cufet\Desktop\测试集"
+# 数据源文件
+DATA_FILE = "中证500成分股数据-快照2.xlsx"
+# 数据源中的 Sheet 名称
+MKT_CAP_SHEET = '自由流通市值'
+STATUS_SHEET = '成分股状态矩阵'
+BL_WEIGHTS_FILE = '优化权重结果.xlsx'
+
+# --- 1. 定义文件完整路径 ---
+data_path = os.path.join(BASE_DATA_PATH, DATA_FILE)
+bl_weights_path = os.path.join(BASE_DATA_PATH, BL_WEIGHTS_FILE)
+#
+# print("--- 🚀 开始直接加载核心数据 🚀 ---")
+# print("-" * 40)
+#
+# # =================================================================
+# # === 任务 A: 加载 BL 优化权重 (用于获取调仓日期) ===
+# # =================================================================
+# print(f"1. 尝试加载 BL 优化权重: {BL_WEIGHTS_FILE}")
+# try:
+#     # 假设：BL 权重文件第一行是日期，第一列是代码。我们使用 header=None 来避免结构假设。
+#     bl_weights_raw = pd.read_excel(bl_weights_path, sheet_name=0, header=None)
+#
+#     # 提取日期 (第一行，从第二列开始)
+#     bl_rebalance_dates_raw = bl_weights_raw.iloc[0, 1:].tolist()
+#     bl_rebalance_dates = pd.to_datetime(bl_rebalance_dates_raw, errors='coerce').dropna().normalize()
+#
+#     # 将第一行作为列名，第一列作为索引，创建最终的 BL 权重 DataFrame
+#     bl_weights_df = bl_weights_raw.iloc[1:].set_index(0)
+#     bl_weights_df.columns = bl_rebalance_dates.tolist()
+#     bl_weights_df.index = bl_weights_df.index.astype(str).str.strip()
+#
+#     # 清理和数值化
+#     bl_weights_df = bl_weights_df.apply(pd.to_numeric, errors='coerce').fillna(0)
+#
+#     print(f"✅ BL 权重数据加载成功。形状: {bl_weights_df.shape}")
+#     print("--- BL 权重 (前 5 行, 仅日期列): ---")
+#     print(bl_weights_df.head(5).iloc[:, :3])
+#     print("-" * 40)
+#
+# except Exception as e:
+#     print(f"❌ 致命错误：加载 BL 权重文件失败。请检查文件路径和结构。详细信息: {e}")
+#     bl_weights_df = pd.DataFrame()
+#
+# # =================================================================
+# # === 任务 B: 加载 成分股状态矩阵 (STATUS_SHEET) - 最终修正版 v3 (手动设置 Header) ===
+# # =================================================================
+# print(f"2. 尝试加载 成分股状态矩阵: {STATUS_SHEET}")
+# try:
+#     # 1. 原始读取：不设 header，读取所有数据
+#     status_raw = pd.read_excel(data_path, sheet_name=STATUS_SHEET, header=None)
+#
+#     # 2. 提取列名 (Header)：来自 Excel 第 2 行 (索引 1)
+#     # 🚨 修正核心：强制使用索引 1 作为列名
+#     header_row = status_raw.iloc[0, :].astype(str).tolist()
+#
+#     # 3. 提取数据体：从 Excel 第 3 行 (索引 2) 开始
+#     status_matrix_df = status_raw.iloc[1:].copy()
+#     status_matrix_df.columns = header_row  # 设置列名
+#
+#     # 4. 清理列名，并设置索引
+#     clean_cols_map = {}
+#     for col in status_matrix_df.columns:
+#         # 清理列名，移除空格、换行符和潜在的 'nan' 字符串
+#         cleaned_col = str(col).strip().replace(' ', '').replace('\n', '').replace('nan', '')
+#         clean_cols_map[col] = cleaned_col
+#
+#     status_matrix_df.columns = clean_cols_map.values()
+#
+#     # 5. 设置索引（股票代码），假设在清理后的第一列
+#     index_col_name = status_matrix_df.columns[0]
+#     status_matrix_df = status_matrix_df.set_index(index_col_name)
+#     status_matrix_df.index = status_matrix_df.index.astype(str).str.strip()
+#
+#     # 6. 规范化列名 (日期) - 采用月末原则
+#     date_cols_map = {}
+#     from pandas.tseries.offsets import MonthEnd
+#
+#     PREFIX = '是否成分股_'  # 明确匹配前缀
+#
+#     for col in status_matrix_df.columns:
+#         if isinstance(col, str) and col.startswith(PREFIX):
+#             date_str = col.replace(PREFIX, '')
+#             dt = pd.to_datetime(date_str, format='%Y-%m', errors='coerce').normalize() + MonthEnd(0)
+#             date_cols_map[col] = dt
+#
+#     # 7. 仅保留日期列并重命名
+#     date_cols = list(date_cols_map.keys())
+#     if not date_cols:
+#         print(f"DEBUG: 最终清理后的列名列表：{status_matrix_df.columns.tolist()}")
+#         raise ValueError("未找到任何能匹配 '是否成分股_YYYY-MM' 格式的列。")
+#
+#     status_matrix_df = status_matrix_df[date_cols]
+#     status_matrix_df.columns = date_cols_map.values()
+#
+#     # 8. 转换为数值 (0/1)
+#     status_matrix_df = status_matrix_df.apply(pd.to_numeric, errors='coerce').fillna(0).astype(int)
+#
+#     print(f"✅ 状态矩阵加载成功。形状: {status_matrix_df.shape}")
+#     print("--- 状态矩阵 (前 5 行): ---")
+#     print(status_matrix_df.head(5).iloc[:, :3])
+#     print("-" * 40)
+#
+# except Exception as e:
+#     print(f"❌ 致命错误：加载状态矩阵失败。请检查 Sheet 名称和结构。详细信息: {e}")
+#     status_matrix_df = pd.DataFrame()
+#
+# # =================================================================
+# # === 任务 C: 加载 自由流通市值 (MKT_CAP_SHEET) - 最终稳定版 v5 (修正 strftime 错误) ===
+# # =================================================================
+# print(f"3. 尝试加载自由流通市值: {MKT_CAP_SHEET}")
+# try:
+#     # 1. 原始读取：不设 header
+#     mkt_cap_raw = pd.read_excel(data_path, sheet_name=MKT_CAP_SHEET, header=None)
+#
+#     # 2. 提取股票代码 (行索引)：Pandas 索引 2 (Excel 第 3 行)，从 Col 1 开始
+#     stock_codes_series = mkt_cap_raw.iloc[2, 1:]
+#
+#     # 3. 提取日期 (列名)：Pandas 索引 3 (Excel 第 4 行) 开始，Col 0
+#     date_series = mkt_cap_raw.iloc[3:, 0]
+#
+#     # 4. 提取市值数据 (NumPy 数组)：Pandas 索引 3 (Excel 第 4 行) 开始，从 Col 1 开始
+#     market_cap_values = mkt_cap_raw.iloc[3:, 1:].values
+#
+#     # --- B. 清理和验证 ---
+#
+#     # 5. 清理股票代码 (过滤 NaN/空值)
+#     valid_cols_mask = stock_codes_series.notna() & (stock_codes_series != '')
+#     valid_stock_codes = stock_codes_series[valid_cols_mask].astype(str).str.strip().tolist()
+#
+#     # 6. 清理日期 (转换为 YYYY-MM-DD 字符串)
+#     valid_dates = pd.to_datetime(date_series, errors='coerce').dropna().dt.normalize()
+#     # 🚨 修正核心：使用 .dt.strftime()
+#     valid_date_strings = valid_dates.dt.strftime('%Y-%m-%d').tolist()
+#
+#     # 7. 过滤市值数据数组，只保留有效股票代码对应的列
+#     valid_market_cap_values = market_cap_values[:, valid_cols_mask.values]
+#
+#     # --- C. 重构 DataFrame ---
+#
+#     # 8. 创建最终 DataFrame
+#     mkt_cap_final = pd.DataFrame(
+#         data=valid_market_cap_values.T,
+#         index=valid_stock_codes,
+#         columns=valid_date_strings
+#     )
+#
+#     # 9. 数值化
+#     mkt_cap_final = mkt_cap_final.apply(lambda x: pd.to_numeric(x, errors='coerce')).fillna(0)
+#     mkt_cap_final = mkt_cap_final.dropna(how='all', axis=0)
+#
+#     print(f"✅ 自由流通市值加载成功。形状: {mkt_cap_final.shape}")
+#     print("--- 自由流通市值 (前 5 行, 仅日期列): ---")
+#     print(mkt_cap_final.head(5).iloc[:, :3])
+#     print("-" * 40)
+#
+# except Exception as e:
+#     print(f"❌ 致命错误：加载自由流通市值失败。请检查 Sheet 名称、结构和索引。详细信息: {e}")
+#     mkt_cap_final = pd.DataFrame()
+#
+# BASE_DATA_PATH = r"C:\Users\cufet\Desktop\测试集"
+# BL_WEIGHTS_FILE = '优化权重结果.xlsx'
+# bl_weights_path = os.path.join(BASE_DATA_PATH, BL_WEIGHTS_FILE)
+#
+# print("--- 🚀 开始加载 BL 优化权重 🚀 ---")
+# print("-" * 40)
+#
+#
+# # =================================================================
+# # === 任务 A: 只读取调仓日 (第一行，从 B 列开始) - 修正版 ===
+# # =================================================================
+# bl_rebalance_dates = []
+#
+# try:
+#     # 1. 原始读取：不设 header，假设第一行是日期
+#     bl_weights_raw = pd.read_excel(bl_weights_path, sheet_name=0, header=None)
+#
+#     # 2. 提取日期 (Excel 第 1 行，从 B 列开始，即 iloc[0, 1:])
+#     bl_rebalance_dates_raw = bl_weights_raw.iloc[0, 1:]
+#
+#     # 3. 规范化为日期对象，移除无效值，并转换为 YYYY-MM-DD 字符串列表
+#
+#     # 🚨 修正核心：使用 .dt.normalize() 和 .dt.strftime()
+#     dates_series = pd.to_datetime(bl_rebalance_dates_raw, errors='coerce').dropna()
+#     dates_series = dates_series.dt.normalize()
+#
+#     # 4. 转换为字符串列表
+#     bl_rebalance_dates = dates_series.dt.strftime('%Y-%m-%d').tolist()
+#
+#     if bl_rebalance_dates:
+#         print(f"✅ BL 调仓日加载成功。共发现 {len(bl_rebalance_dates)} 个调仓日。")
+#         print("--- 前 5 个调仓日: ---")
+#         print(bl_rebalance_dates[:5])
+#     else:
+#         print("❌ 警告：调仓日列表为空。请检查 Excel 文件第一行 B 列及之后的日期格式。")
+#
+#     print("-" * 40)
+#
+# except Exception as e:
+#     print(f"❌ 致命错误：只读取调仓日失败。请检查文件路径和结构。详细信息: {e}")
+#     bl_rebalance_dates = []
+#
+# # =================================================================
+# # === 新增逻辑：第一步：找到调仓日期对应的当日自由流通市值 ===
+# # =================================================================
+# print("\n--- 🚀 新增逻辑：第一步：找到调仓日市值 🚀 ---")
+#
+# # 确保所有数据加载成功
+# if 'mkt_cap_final' not in locals() or mkt_cap_final.empty:
+#     print("❌ 错误：mkt_cap_final 未成功加载或为空，无法执行后续步骤。")
+# elif not bl_rebalance_dates:
+#     print("❌ 错误：BL 调仓日 bl_rebalance_dates 列表为空，无法执行后续步骤。")
+# else:
+#     # 存储每个调仓日市值 Series 的字典
+#     rebalance_date_mkt_cap = {}
+#
+#     # 1. 将 mkt_cap_final 的列名 (日期字符串) 转换为 datetime 对象，方便后续查找
+#     # 注意：为了不修改原有 mkt_cap_final，我们创建一个副本或使用一个临时的日期列表进行查找
+#     mkt_cap_dates = mkt_cap_final.columns.tolist()
+#
+#     print(f"市值数据日期范围: {mkt_cap_dates[0]} 到 {mkt_cap_dates[-1]} (共 {len(mkt_cap_dates)} 天)")
+#
+#     for date_str in bl_rebalance_dates:
+#         try:
+#             # 找到市值数据中，列名与调仓日精确匹配的列
+#             if date_str in mkt_cap_final.columns:
+#                 # 提取当日的自由流通市值 (一个 Series，索引是股票代码)
+#                 daily_mkt_cap_series = mkt_cap_final[date_str]
+#                 rebalance_date_mkt_cap[date_str] = daily_mkt_cap_series
+#             else:
+#                 # 调仓日不在市值数据的日期范围或格式不匹配
+#                 # 打印警告，并尝试向前找最近的日期（如果需要，但目前仅要求当日）
+#                 print(f"⚠️ 调仓日 {date_str} 的市值数据未找到，跳过。")
+#
+#         except Exception as e:
+#             print(f"❌ 查找调仓日 {date_str} 市值时发生错误: {e}")
+#             continue
+#
+#     if rebalance_date_mkt_cap:
+#         print(f"\n✅ 成功找到 {len(rebalance_date_mkt_cap)} 个调仓日的市值数据。")
+#
+#         # 打印第一个调仓日的市值数据作为验证
+#         first_date = next(iter(rebalance_date_mkt_cap))
+#         first_mkt_cap = rebalance_date_mkt_cap[first_date]
+#
+#         print(f"--- 调仓日 {first_date} 的自由流通市值 (前 5 个): ---")
+#         # 筛选出市值大于 0 的前 5 个股票
+#         print(first_mkt_cap[first_mkt_cap > 0].head())
+#     else:
+#         print("❌ 警告：没有调仓日与市值数据日期精确匹配。请检查两个日期列表的格式和范围是否一致。")
+#
+# print("-" * 40)
+#
+# # =================================================================
+# # === 新增逻辑：第二步骤：调仓日和成分股状态矩阵的调仓日对应 ===
+# # =================================================================
+# print("\n--- 🚀 新增逻辑：第二步骤：匹配成分股状态日期 🚀 ---")
+#
+# if 'status_matrix_df' not in locals() or status_matrix_df.empty:
+#     print("❌ 错误：status_matrix_df 未成功加载或为空，无法执行成分股状态匹配。")
+# elif not bl_rebalance_dates:
+#     print("❌ 错误：BL 调仓日 bl_rebalance_dates 列表为空，无法执行后续步骤。")
+# else:
+#     # 存储最终结果：{调仓日: 匹配到的状态 Series}
+#     matched_status_series = {}
+#
+#     # 将状态矩阵的列名（datetime对象）转换为 Python 的 datetime 列表，方便排序和查找
+#     # 确保状态矩阵的列是 datetime 对象，方便比较
+#     status_dates = status_matrix_df.columns.tolist()
+#
+#     # 转换为 Series，方便使用 idxmax() 或类似的函数进行高效查找
+#     status_dates_series = pd.Series(status_dates)
+#
+#     print(
+#         f"状态矩阵日期范围: {min(status_dates).strftime('%Y-%m-%d')} 到 {max(status_dates).strftime('%Y-%m-%d')} (共 {len(status_dates)} 个快照)")
+#
+#     for date_str in bl_rebalance_dates:
+#         rebalance_date = pd.to_datetime(date_str)
+#
+#         # 筛选所有小于调仓日的成分股状态日期
+#         previous_status_dates = status_dates_series[status_dates_series < rebalance_date]
+#
+#         if previous_status_dates.empty:
+#             print(f"⚠️ 调仓日 {date_str} 之前没有可用的成分股状态快照，跳过。")
+#             continue
+#
+#         # 找到小于调仓日且距离调仓日最近的日期
+#         # 通过 idxmax() 找到最大值（即最接近调仓日的日期）
+#         closest_status_date = previous_status_dates.max()
+#
+#         # 提取该日期的成分股状态 Series
+#         # 注意：status_matrix_df 的列名是 datetime 对象
+#         status_series = status_matrix_df[closest_status_date]
+#
+#         # 记录结果，使用调仓日作为键
+#         matched_status_series[date_str] = status_series
+#
+#         # 可选：打印匹配信息
+#         print(f"调仓日 {date_str} 匹配到状态快照: {closest_status_date.strftime('%Y-%m-%d')}")
+#
+#     if matched_status_series:
+#         print(f"\n✅ 成功将 {len(matched_status_series)} 个调仓日匹配到成分股状态快照。")
+#
+#         # 打印第一个匹配结果作为验证
+#         first_date = next(iter(matched_status_series))
+#         first_status = matched_status_series[first_date]
+#
+#         print(f"--- 调仓日 {first_date} 匹配到的状态 Series (前 5 个): ---")
+#         # 筛选出状态为 1 的前 5 个股票
+#         print(first_status[first_status == 1].head())
+#     else:
+#         print("❌ 警告：没有调仓日能够匹配到之前的成分股状态快照。")
+#
+# print("-" * 40)
+#
+# # === 新增逻辑：第三步骤：提取调仓日被标记为 1 的成分股市值 (final_component_mkt_cap) ===
+# # =================================================================
+# # 🚨 关键：初始化 final_component_mkt_cap，确保后续第四步能访问
+# final_component_mkt_cap = {}
+# print("\n--- 🚀 新增逻辑：第三步骤：提取成分股市值 🚀 ---")
+#
+# # 确保 rebalance_date_mkt_cap 和 matched_status_series 存在（它们应该在第一和第二步骤中被定义）
+#
+# # 假设 rebalance_date_mkt_cap 和 matched_status_series 已经被前面的逻辑块成功填充。
+# # 我们只需要检查它们是否非空。
+#
+# if ('rebalance_date_mkt_cap' in locals() and rebalance_date_mkt_cap) and \
+#         ('matched_status_series' in locals() and matched_status_series):
+#
+#     processed_count = 0
+#     for date_str, status_series in matched_status_series.items():
+#         if date_str in rebalance_date_mkt_cap:
+#             daily_mkt_cap_series = rebalance_date_mkt_cap[date_str]
+#
+#             # 1. 对齐市值数据和状态数据 (join='inner' 确保只保留共同的股票)
+#             aligned_data = pd.concat([daily_mkt_cap_series, status_series], axis=1, join='inner')
+#             aligned_data.columns = ['MKT_CAP', 'STATUS']
+#
+#             # 2. 筛选 STATUS == 1 (成分股) 且 MKT_CAP > 0 (有效市值)
+#             component_mkt_cap = aligned_data[
+#                 (aligned_data['STATUS'] == 1) & (aligned_data['MKT_CAP'] > 0)
+#                 ]['MKT_CAP']
+#
+#             if not component_mkt_cap.empty:
+#                 final_component_mkt_cap[date_str] = component_mkt_cap
+#                 processed_count += 1
+#
+#     if final_component_mkt_cap:
+#         print(f"✅ 成功从 {processed_count} 个调仓日中提取了成分股市值数据。")
+#
+#         # 打印第一个调仓日的成分股市值作为验证
+#         first_date = next(iter(final_component_mkt_cap))
+#         first_mkt_cap = final_component_mkt_cap[first_date]
+#
+#         print(f"--- 调仓日 {first_date} 的成分股自由流通市值 (前 5 个): ---")
+#         print(first_mkt_cap.head())
+#         print(f"该日成分股总数: {len(first_mkt_cap)}")
+#     else:
+#         print("❌ 警告：所有调仓日市值筛选后为空。请检查数据对齐和筛选条件。")
+#
+# else:
+#     print("❌ 错误：市值或状态匹配数据缺失，跳过第三步骤。")
+# print("-" * 40)
+#
+# # -------------------- 在 第四步骤 之前插入以下诊断代码 --------------------
+# print("\n--- 诊断：检查最终市值数据 (final_component_mkt_cap) ---")
+#
+# if final_component_mkt_cap:
+#     first_date = next(iter(final_component_mkt_cap))
+#     first_mkt_cap = final_component_mkt_cap[first_date]
+#
+#     print(f"检查日期: {first_date}")
+#     print(f"数据总数: {len(first_mkt_cap)}")
+#     print(f"数据类型: {first_mkt_cap.dtype}")
+#     print("市值统计量:")
+#     print(first_mkt_cap.describe())
+#
+#     # 打印前20个值，以确认它们是否都相等
+#     print("\n前20个市值值:")
+#     print(first_mkt_cap.head(20))
+# else:
+#     print("市值字典为空，无法诊断。")
+#
+# print("-" * 40)
+# # -------------------- 继续执行 第四步骤 --------------------
+#
+# # =================================================================
+# # === 新增逻辑：第四步骤：计算成分股权重 (基于自由流通市值) ===
+# # =================================================================
+# print("\n--- 🚀 新增逻辑：第四步骤：计算成分股权重 🚀 ---")
+#
+# # 存储最终结果：{调仓日: 股票权重 Series}
+# final_component_weights = {}
+#
+# if 'final_component_mkt_cap' not in locals():
+#     # 尝试恢复变量，以防前一步骤逻辑块定义后未在全局生效
+#     final_component_mkt_cap = {}
+#
+# if final_component_mkt_cap:
+#     processed_count = 0
+#     # 遍历每个调仓日及其成分股市值 Series
+#     for date_str, mkt_cap_series in final_component_mkt_cap.items():
+#
+#         # 1. 计算所有成分股的总市值 (分母)
+#         total_mkt_cap = mkt_cap_series.sum()
+#
+#         if total_mkt_cap > 0:
+#             # 2. 计算权重：个股市值 / 总市值
+#             weights_series = mkt_cap_series / total_mkt_cap
+#             final_component_weights[date_str] = weights_series
+#             processed_count += 1
+#         else:
+#             print(f"⚠️ 调仓日 {date_str} 的总市值计算为零，无法计算权重，跳过。")
+#
+#     if final_component_weights:
+#         print(f"\n✅ 成功计算了 {processed_count} 个调仓日的成分股权重。")
+#
+#         # 打印第一个调仓日的成分股权重作为验证
+#         first_date = next(iter(final_component_weights))
+#         first_weights = final_component_weights[first_date]
+#
+#         print(f"--- 调仓日 {first_date} 的成分股权重 (前 5 个): ---")
+#         print(first_weights.head())
+#         print(f"该日权重总和 (应接近 1.0): {first_weights.sum():.6f}")
+#     else:
+#         print("❌ 警告：没有调仓日能够成功计算权重。")
+# else:
+#     print("❌ 错误：成分股市值数据 final_component_mkt_cap 缺失，跳过第四步骤。")
+#
+# print("-" * 40)
+#
+# # =================================================================
+# # === 新增逻辑：第五步骤：将权重输出到 Excel 文件 ===
+# # =================================================================
+# print("\n--- 🚀 新增逻辑：第五步骤：导出权重数据 🚀 ---")
+#
+# if final_component_weights:
+#     # 1. 将字典转换为 DataFrame
+#     # DataFrame 的列名为日期，索引为股票代码
+#     weights_df = pd.DataFrame(final_component_weights)
+#
+#     # 2. 填充 NaN 为 0 (可选，但通常权重数据习惯没有值就认为是 0)
+#     weights_df = weights_df.fillna(0)
+#
+#     # 3. 定义输出文件路径
+#     OUTPUT_FILE = "计算基准权重结果.xlsx"
+#     output_path = os.path.join(BASE_DATA_PATH, OUTPUT_FILE)
+#
+#     try:
+#         # 4. 导出到 Excel
+#         weights_df.to_excel(output_path, float_format='%.8f')
+#         print(f"✅ 权重数据成功导出到文件: {OUTPUT_FILE}")
+#         print(f"   文件路径: {output_path}")
+#         print(f"   最终权重矩阵形状: {weights_df.shape}")
+#
+#     except Exception as e:
+#         print(f"❌ 导出 Excel 文件失败。详细信息: {e}")
+#
+# else:
+#     print("❌ 错误：没有计算出任何成分股权重，跳过导出步骤。")
+#
+# print("-" * 40)
+#
+# =================================================================
+# === 新增逻辑：第六步骤：合并基准权重和 BL 优化权重 (70/30) ===
+# =================================================================
+print("\n--- 🚀 新增逻辑：第六步骤：合并并导出最终权重 🚀 ---")
+
+# --- 配置文件路径 ---
+BENCHMARK_WEIGHTS_FILE = "计算基准权重结果.xlsx"
+BL_HOLDINGS_FILE = "BL优化策略_持仓市值详情.xlsx"
+
+benchmark_path = os.path.join(BASE_DATA_PATH, BENCHMARK_WEIGHTS_FILE)
+bl_holdings_path = os.path.join(BASE_DATA_PATH, BL_HOLDINGS_FILE)
+
+# --- 1. 读取数据 ---
+try:
+    print(f"1. 读取基准权重: {BENCHMARK_WEIGHTS_FILE}")
+    # 假设基准权重文件第一行是日期，第一列是代码
+    benchmark_weights_df = pd.read_excel(benchmark_path, index_col=0)
+    # 确保列名是 datetime 对象 (或者至少是可比较的字符串)
+    benchmark_weights_df.columns = pd.to_datetime(benchmark_weights_df.columns).strftime('%Y-%m-%d')
+    print(f"   ✅ 基准权重形状: {benchmark_weights_df.shape}")
+
+    print(f"2. 读取 BL 优化权重: {BL_HOLDINGS_FILE}")
+    # 假设 BL 权重文件第一行是日期，第一列是代码
+    # 注意：BL优化策略_持仓市值详情.xlsx 文件可能需要根据实际结构调整读取方式
+    # 这里假设它与基准权重结构相同 (第一列代码，后续列日期)
+    bl_weights_df_raw = pd.read_excel(bl_holdings_path, header=None)
+
+    # 提取 BL 权重：假设第一行是日期，第一列是代码。
+    bl_dates = pd.to_datetime(bl_weights_df_raw.iloc[0, 1:].tolist(), errors='coerce').dropna().strftime('%Y-%m-%d')
+
+    bl_weights_df = bl_weights_df_raw.iloc[1:].set_index(0)
+    bl_weights_df.columns = bl_dates
+    bl_weights_df.index.name = None
+
+    # 优化权重通常以市值或持仓量形式给出，这里我们假设它存储的是权重或需要计算权重
+    # 如果 BL_HOLDINGS_FILE 存储的是市值，则需要先计算权重。但根据文件名，我们假设其包含了权重信息。
+    # 我们将数值化所有数据并填充 NaN (未持有的股票权重为 0)
+    bl_weights_df = bl_weights_df.apply(pd.to_numeric, errors='coerce').fillna(0)
+    print(f"   ✅ BL 优化权重形状: {bl_weights_df.shape}")
+
+except Exception as e:
+    print(f"❌ 错误：加载权重文件失败。请检查文件路径和内部结构。详细信息: {e}")
+    print("-" * 40)
+    # 终止后续操作
+    raise
+
+# --- 2. 对齐、合并计算权重 ---
+
+# 统一所有股票代码和调仓日期，确保两个 DataFrame 能够对齐
+all_index = benchmark_weights_df.index.union(bl_weights_df.index)
+all_columns = benchmark_weights_df.columns.union(bl_weights_df.columns)
+
+# 重新索引并填充 0
+W_b = benchmark_weights_df.reindex(index=all_index, columns=all_columns).fillna(0)  # 基准权重 (W_b)
+W_bl = bl_weights_df.reindex(index=all_index, columns=all_columns).fillna(0)  # BL 优化权重 (W_bl)
+
+# 定义分配比例
+ALPHA = 0.70  # 基准权重占比
+BETA = 0.30  # BL 优化权重占比
+
+print("\n3. 开始计算合并权重...")
+
+# 计算最终权重：W_final = W_b * ALPHA + W_bl * BETA
+final_combined_weights_df = (W_b * ALPHA) + (W_bl * BETA)
+
+print("   ✅ 合并权重计算完成。")
+print("--- 最终合并权重 (前 5 行, 前 3 列): ---")
+print(final_combined_weights_df.head(5).iloc[:, :3])
+
+# --- 3. 导出结果 ---
+
+OUTPUT_COMBINED_FILE = "最终合并权重_70_30.xlsx"
+output_combined_path = os.path.join(BASE_DATA_PATH, OUTPUT_COMBINED_FILE)
+
+try:
+    # 导出到 Excel
+    final_combined_weights_df.to_excel(output_combined_path, float_format='%.8f')
+    print(f"\n4. 权重数据成功导出到文件: {OUTPUT_COMBINED_FILE}")
+    print(f"   文件路径: {output_combined_path}")
+    print(f"   最终合并权重矩阵形状: {final_combined_weights_df.shape}")
+
+except Exception as e:
+    print(f"❌ 错误：导出最终合并权重 Excel 文件失败。详细信息: {e}")
+
+print("-" * 40)
