@@ -1,0 +1,652 @@
+from datetime import timedelta
+import pandas as pd
+import numpy as np
+import os
+import warnings
+import matplotlib
+
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+
+import matplotlib.dates as mdates
+from datetime import timedelta
+
+# --- 辅助设置 ---
+warnings.filterwarnings('ignore')
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+# 忽略 openpyxl 相关的警告
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+
+# =========================================================================
+# === SimplePortfolioBacktester 类定义 (已修改) ===
+# =========================================================================
+
+class SimplePortfolioBacktester:
+    # 策略名称更新为合并策略
+    STRATEGY_NAME = '最终合并策略'
+
+    def __init__(self, data_path, stock_data_file, csi_data_file, csi500_simple_data_file):
+        self.data_path = data_path
+        self.stock_data_file = stock_data_file
+
+        self.csi500_tr_data_file = csi_data_file
+        self.csi500_sr_data_file = csi500_simple_data_file
+
+        self.price_data = None
+        self.custom_matrix = None
+
+        self.csi500_tr_returns = None
+        self.csi500_sr_returns = None
+
+        self.metrics_results = {}
+        self.daily_holdings_history = []
+
+        self.initial_capital = 1000000000  # 初始资金10亿
+        self.buy_fee = 0.0003  # 买入费率 0.03% (万3)
+        self.sell_fee = 0.0013  # 卖出费率 0.13% (含印花税)
+
+        self._load_all_data()
+
+    def _load_all_data(self):
+        """加载所有数据：股票价格、自定义组合矩阵、中证500全收益、中证500普通收益。"""
+
+        # 1. 加载股票收盘价 (假设路径)
+        try:
+            file_path = os.path.join(self.data_path, self.stock_data_file)
+            df = pd.read_excel(file_path, sheet_name='Sheet1', header=0)
+            df = df.iloc[1:].set_index(df.columns[0])
+            df.index = pd.to_datetime(df.index)
+            df.columns = df.columns.astype(str)
+            self.price_data = df.apply(pd.to_numeric, errors='coerce').ffill()
+            print(f"股票价格数据形状: {self.price_data.shape}")
+        except Exception as e:
+            print(f"加载股票价格数据失败: {e}")
+            self.price_data = pd.DataFrame()
+
+        # 2. 加载自定义组合状态矩阵 (权重文件已修改)
+        try:
+            # 🚨 修改点 1: 权重文件路径更新为合并后的权重
+            weights_file_path = os.path.join(self.data_path, '最终合并权重_70_30.xlsx')
+            df = pd.read_excel(weights_file_path, sheet_name='Sheet1', index_col=0)  # 假设导出的Excel默认Sheet为Sheet1
+            self.custom_matrix = df
+            self.custom_matrix.index = self.custom_matrix.index.astype(str)
+            self.custom_matrix.columns = pd.to_datetime(self.custom_matrix.columns)
+            print(f"自定义权重矩阵形状 (最终合并策略): {self.custom_matrix.shape}")
+        except Exception as e:
+            # 尝试不指定 sheet_name，直接读取第一个sheet
+            try:
+                df = pd.read_excel(weights_file_path, index_col=0)
+                self.custom_matrix = df
+                self.custom_matrix.index = self.custom_matrix.index.astype(str)
+                self.custom_matrix.columns = pd.to_datetime(self.custom_matrix.columns)
+                print(f"自定义权重矩阵形状 (最终合并策略 - 默认Sheet): {self.custom_matrix.shape}")
+            except Exception as e_retry:
+                print(f"加载自定义权重矩阵失败 (已尝试默认Sheet)。详细信息: {e_retry}")
+                self.custom_matrix = pd.DataFrame()
+
+        # 3. 加载中证500全收益指数数据 (CSI500_TR)
+        try:
+            file_path = os.path.join(self.data_path, self.csi500_tr_data_file)
+            df = pd.read_excel(file_path, header=0)
+            df.rename(columns={df.columns[0]: 'Date', df.columns[1]: 'Close'}, inplace=True)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.set_index('Date', inplace=True)
+            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+            df = df.sort_index().dropna(subset=['Close'])
+            self.csi500_tr_returns = df['Close'].pct_change().dropna()
+            print(f"中证500全收益指数数据形状: {self.csi500_tr_returns.shape}")
+        except Exception as e:
+            print(f"加载中证500全收益指数数据失败: {e}")
+            self.csi500_tr_returns = pd.Series()
+
+        # 4. 加载中证500普通指数数据 (CSI500_SR)
+        try:
+            file_path = os.path.join(self.data_path, self.csi500_sr_data_file)
+            df = pd.read_excel(file_path, header=0)
+            df.rename(columns={df.columns[0]: 'Date', df.columns[1]: 'Close'}, inplace=True)
+            df['Date'] = pd.to_datetime(df['Date'])
+            df.set_index('Date', inplace=True)
+            df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+            df = df.sort_index().dropna(subset=['Close'])
+            self.csi500_sr_returns = df['Close'].pct_change().dropna()
+            print(f"中证500普通指数数据形状: {self.csi500_sr_returns.shape}")
+        except Exception as e:
+            print(f"加载中证500普通指数数据失败: {e}")
+            self.csi500_sr_returns = pd.Series()
+
+    # (get_custom_weights_by_date 方法保持不变)
+    def get_custom_weights_by_date(self, rebalance_date):
+        if self.custom_matrix.empty:
+            return {}
+
+        rebalance_date = pd.to_datetime(rebalance_date)
+
+        valid_cols = self.custom_matrix.columns[self.custom_matrix.columns <= rebalance_date]
+        if valid_cols.empty:
+            return {}
+
+        target_col_date = valid_cols.max()
+
+        weights_series = self.custom_matrix[target_col_date].dropna()
+        new_weights = weights_series[weights_series > 1e-8].to_dict()
+
+        if not new_weights:
+            return {}
+
+        available_stocks_weights = {
+            s: w for s, w in new_weights.items()
+            if s in self.price_data.columns
+        }
+
+        total_weight = sum(available_stocks_weights.values())
+        if total_weight > 0:
+            available_stocks_weights = {s: w / total_weight for s, w in available_stocks_weights.items()}
+
+        return available_stocks_weights
+
+    def run_backtest(self, start_date='2023-01-20', end_date='2025-09-30'):
+        """执行回测并返回结果DataFrame，采用增量调仓逻辑，并计算两个中证500基准净值。"""
+
+        if (self.price_data.empty or self.custom_matrix.empty or
+                self.csi500_tr_returns.empty or self.csi500_sr_returns.empty):
+            print("数据不完整，无法进行回测。")
+            return None
+
+        # --- 确定回测周期和调仓日 ---
+        rebalance_dates = self.custom_matrix.columns.sort_values().tolist()
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        all_trading_dates = self.price_data.index.intersection(self.csi500_tr_returns.index).intersection(
+            self.csi500_sr_returns.index)
+        all_trading_dates = all_trading_dates[
+            (all_trading_dates >= start_dt) &
+            (all_trading_dates <= end_dt)
+            ]
+
+        if all_trading_dates.empty:
+            print("回测区间内无交易日数据。")
+            return None
+
+        first_trading_date = all_trading_dates[0]
+        future_rebalance_dates = [d for d in rebalance_dates if d > first_trading_date and d <= end_dt]
+
+        # --- 初始化 ---
+        # 🚨 修改点 2: 策略名称更新
+        strategy_name = self.STRATEGY_NAME
+        current_shares = {}
+        cash = self.initial_capital
+        cumulative_returns = pd.Series(index=all_trading_dates, dtype=float)
+
+        csi500_tr_value = self.initial_capital
+        csi500_tr_values = pd.Series(index=all_trading_dates, dtype=float)
+
+        csi500_sr_value = self.initial_capital
+        csi500_sr_values = pd.Series(index=all_trading_dates, dtype=float)
+
+        self.daily_holdings_history = []
+
+        print(f"--- 回测开始 ({strategy_name})，初始资金: {self.initial_capital / 10000:.0f} 万元 ---")
+
+        # 记录前一日的持仓（用作今日期初）
+        prev_shares = current_shares.copy()
+
+        for i, date in enumerate(all_trading_dates):
+
+            # --- 记录期初持仓 (前一日的期末) ---
+            initial_holdings_data = []
+            if i > 0 or (i == 0 and len(current_shares) > 0):
+                try:
+                    open_prices = self.price_data.loc[date].to_dict()
+                except KeyError:
+                    open_prices = {}
+
+                for stock, shares in prev_shares.items():
+                    price = open_prices.get(stock, np.nan)
+                    if not pd.isna(price) and price > 0 and shares > 0:
+                        initial_holdings_data.append({
+                            '日期': date,
+                            '股票代码': stock,
+                            '持仓类型': '期初',
+                            '持仓股数': shares,
+                            '收盘价': price,
+                            '持仓市值': shares * price
+                        })
+
+            # --- 现金利息 ---
+            if i > 0:
+                daily_interest_rate = 0.015 / 252
+                cash += cash * daily_interest_rate
+
+            # --- 步骤 1：处理 i=0 的初始净值记录 ---
+            if i == 0:
+                cumulative_returns.loc[date] = self.initial_capital
+                csi500_tr_values.loc[date] = self.initial_capital
+                csi500_sr_values.loc[date] = self.initial_capital
+
+                # 记录期初数据
+            self.daily_holdings_history.extend(initial_holdings_data)
+
+            # --- 步骤 2：增量调仓逻辑 ---
+            if date in future_rebalance_dates:
+                sell_fee_total = 0
+                buy_fee_total = 0
+
+                try:
+                    current_prices = self.price_data.loc[date].to_dict()
+                except KeyError:
+                    print(f"警告：调仓日 {date.strftime('%Y-%m-%d')} 价格数据缺失，跳过调仓。")
+                    prev_shares = current_shares.copy()
+                    continue
+
+                new_weights = self.get_custom_weights_by_date(date)
+
+                # ... 增量调仓计算逻辑 (保持不变) ...
+                current_market_value = sum(current_shares.get(stock, 0) * current_prices.get(stock, 0)
+                                           for stock in current_shares.keys())
+                current_portfolio_value = current_market_value + cash
+                target_market_value = current_portfolio_value if new_weights else 0
+                target_shares = {}
+                stock_list_all = set(current_shares.keys()) | set(new_weights.keys())
+                stock_diff = {}
+                for stock in stock_list_all:
+                    weight = new_weights.get(stock, 0)
+                    price = current_prices.get(stock, 0)
+                    current_s = current_shares.get(stock, 0)
+                    if price > 0:
+                        target_val = target_market_value * weight
+                        target_s = int((target_val / price) // 100) * 100
+                        diff = target_s - current_s
+                        stock_diff[stock] = diff
+                        target_shares[stock] = target_s
+                sell_value_total = 0
+                for stock, diff in stock_diff.items():
+                    if diff < 0:
+                        shares_to_sell = abs(diff)
+                        price = current_prices.get(stock)
+                        value = shares_to_sell * price
+                        fee = value * self.sell_fee
+                        sell_fee_total += fee
+                        sell_value_total += value
+                        current_shares[stock] = target_shares[stock]
+                cash += (sell_value_total - sell_fee_total)
+                buy_value_pending = 0
+                buy_list = {}
+                for stock, diff in stock_diff.items():
+                    if diff > 0:
+                        shares_to_buy = diff
+                        price = current_prices.get(stock)
+                        cost = shares_to_buy * price
+                        buy_value_pending += cost
+                        buy_list[stock] = (shares_to_buy, cost)
+                if buy_value_pending > 0 and buy_value_pending <= cash:
+                    for stock, (shares, cost) in buy_list.items():
+                        fee = cost * self.buy_fee
+                        buy_fee_total += fee
+                        current_shares[stock] = target_shares[stock]
+                    cash -= buy_value_pending
+                    cash -= buy_fee_total
+                    print(
+                        f"调仓日 {date.strftime('%Y-%m-%d')} - 卖出费: {sell_fee_total:.2f}, 买入费: {buy_fee_total:.2f}, 调仓股票数: {len(current_shares)}, 剩余现金: {cash:.2f}")
+                elif buy_value_pending > cash:
+                    print(
+                        f"警告：调仓日 {date.strftime('%Y-%m-%d')} 购买现金不足 ({buy_value_pending:.2f} > {cash:.2f})，放弃本次买入。")
+                    for stock, diff in stock_diff.items():
+                        if diff < 0:
+                            pass
+                # -------------------------------------------------------------
+
+            # --- 步骤 3：每日净值更新 ---
+            yesterday = all_trading_dates[i - 1] if i > 0 else date
+            stock_market_value = 0
+
+            end_holdings_data = []
+
+            if current_shares:
+                portfolio_stocks = list(current_shares.keys())
+                try:
+                    today_prices = self.price_data.loc[date, portfolio_stocks].to_dict()
+                except KeyError:
+                    if i > 0:
+                        portfolio_value = cumulative_returns.loc[yesterday]
+                        cumulative_returns.loc[date] = portfolio_value
+                        csi500_tr_values.loc[date] = csi500_tr_values.loc[yesterday]
+                        csi500_sr_values.loc[date] = csi500_sr_values.loc[yesterday]
+
+                        prev_shares = current_shares.copy()
+                        continue
+                    else:
+                        portfolio_value = self.initial_capital
+
+                for stock, shares in current_shares.items():
+                    price = today_prices.get(stock, np.nan)
+                    if not pd.isna(price) and price > 0:
+                        stock_market_value += shares * price
+
+                        end_holdings_data.append({
+                            '日期': date,
+                            '股票代码': stock,
+                            '持仓类型': '期末',
+                            '持仓股数': shares,
+                            '收盘价': price,
+                            '持仓市值': shares * price
+                        })
+
+                if date in future_rebalance_dates:
+                    new_weights = self.get_custom_weights_by_date(date)
+                    end_holdings_data = [holding for holding in end_holdings_data
+                                         if new_weights.get(holding['股票代码'], 0) > 0]
+
+            portfolio_value = stock_market_value + cash
+
+            # 基准净值更新
+            daily_csi500_tr_return = self.csi500_tr_returns.get(date, 0.0)
+            daily_csi500_sr_return = self.csi500_sr_returns.get(date, 0.0)
+
+            if i > 0:
+                csi500_tr_value *= (1 + daily_csi500_tr_return)
+                csi500_sr_value *= (1 + daily_csi500_sr_return)
+
+                # --- 步骤 4：记录净值 ---
+            if i > 0 or (i == 0 and len(current_shares) > 0):
+                cumulative_returns.loc[date] = portfolio_value
+                csi500_tr_values.loc[date] = csi500_tr_value
+                csi500_sr_values.loc[date] = csi500_sr_value
+
+            self.daily_holdings_history.extend(end_holdings_data)
+            prev_shares = current_shares.copy()
+
+        # 将净值数据合并，并计算每日收益率
+        cumulative_value_df = pd.DataFrame({
+            strategy_name: cumulative_returns,
+            'CSI500_TR_Benchmark_Value': csi500_tr_values,
+            'CSI500_SR_Benchmark_Value': csi500_sr_values
+        }).dropna()
+
+        daily_returns_df = cumulative_value_df.pct_change().dropna()
+        self.calculate_metrics(daily_returns_df, cumulative_value_df)
+
+        # 季度收益率统计
+        quarterly_value_df = cumulative_value_df.resample('Q').ffill().dropna()
+        quarterly_returns_df = quarterly_value_df.pct_change().dropna()
+
+        quarterly_returns_df.rename(columns={
+            strategy_name: f'{strategy_name}_季度收益率(%)',
+            'CSI500_TR_Benchmark_Value': 'CSI500_TR_Benchmark_季度收益率(%)',
+            'CSI500_SR_Benchmark_Value': 'CSI500_SR_Benchmark_季度收益率(%)'
+        }, inplace=True)
+
+        quarterly_returns_df *= 100
+        print("\n--- 季度收益率统计 ---")
+        print(quarterly_returns_df)
+
+        # 最终返回累计收益率百分比
+        results_df = pd.DataFrame({
+            strategy_name: (cumulative_returns / self.initial_capital - 1) * 100,
+            'CSI500_TR_Benchmark': (csi500_tr_values / self.initial_capital - 1) * 100,
+            'CSI500_SR_Benchmark': (csi500_sr_values / self.initial_capital - 1) * 100
+        })
+
+        return results_df.dropna()
+
+    def _output_holdings_to_excel(self, output_file_name):
+        """将收集到的每日持仓市值数据导出到 Excel，按调仓日分sheet，宽数据格式"""
+        if not self.daily_holdings_history:
+            print("持仓历史数据为空，不进行导出。")
+            return
+
+        df = pd.DataFrame(self.daily_holdings_history)
+        df['日期'] = pd.to_datetime(df['日期'])
+        df = df[df['持仓类型'] == '期末']
+
+        rebalance_dates = self.custom_matrix.columns.sort_values().tolist()
+        df_start_date = df['日期'].min()
+
+        output_path = os.path.join(self.data_path, output_file_name)  # 使用传入的 output_file_name
+
+        try:
+            # 使用 ExcelWriter 写入结果
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # 为每个调仓周期创建一个sheet
+                for i in range(len(rebalance_dates)):
+                    if i == 0:
+                        start_date = df_start_date
+                        end_date = rebalance_dates[i]
+                        if end_date < start_date:
+                            end_date = start_date
+                        period_df = df[(df['日期'] >= start_date) & (df['日期'] <= end_date)]
+                        sheet_name = f"周期1_{end_date.strftime('%Y%m%d')}"
+
+                    else:
+                        start_date = rebalance_dates[i - 1] + timedelta(days=1)
+                        end_date = rebalance_dates[i]
+                        period_df = df[(df['日期'] >= start_date) & (df['日期'] <= end_date)]
+                        sheet_name = f"周期{i + 1}_{end_date.strftime('%Y%m%d')}"
+
+                    if period_df.empty:
+                        print(f"跳过空sheet: {sheet_name} (无数据)")
+                        continue
+
+                    pivot_df = period_df.pivot_table(
+                        index='股票代码',
+                        columns='日期',
+                        values='持仓市值',
+                        aggfunc='first'
+                    ).fillna(0)
+
+                    pivot_df.to_excel(writer, sheet_name=sheet_name)
+                    print(f"创建sheet: {sheet_name}, 数据形状: {pivot_df.shape}")
+
+                # 最后一个调仓周期之后的数据
+                if rebalance_dates:
+                    last_rebalance = rebalance_dates[-1]
+                    last_period_df = df[df['日期'] > last_rebalance]
+                    if not last_period_df.empty:
+                        sheet_name = f"最后周期_{df['日期'].max().strftime('%Y%m%d')}"
+                        pivot_df = last_period_df.pivot_table(
+                            index='股票代码',
+                            columns='日期',
+                            values='持仓市值',
+                            aggfunc='first'
+                        ).fillna(0)
+                        pivot_df.to_excel(writer, sheet_name=sheet_name)
+                        print(f"创建sheet: {sheet_name}, 数据形状: {pivot_df.shape}")
+
+            print(f"\n成功导出个股持仓市值详情至: {output_path}")
+
+        except Exception as e:
+            print(f"\n导出个股持仓市值详情失败: {e}")
+
+    def calculate_metrics(self, daily_returns_df, cumulative_value_df):
+        """计算雷达图所需指标，并将结果存储在 self.metrics_results 中。"""
+        if daily_returns_df.empty or cumulative_value_df.empty:
+            print("每日收益率或累计净值数据为空，无法计算绩效指标。")
+            return
+
+        risk_free_rate_daily = 0.015 / 250
+        trading_days_per_year = 250
+
+        strategy_col = self.STRATEGY_NAME
+        csi_col_daily = 'CSI500_TR_Benchmark_Value'  # 用于相对指标 (全收益为基准)
+
+        total_days = len(daily_returns_df)
+        total_return_strategy = (1 + daily_returns_df[strategy_col]).prod() - 1
+
+        annualized_return_strategy = (1 + total_return_strategy) ** (trading_days_per_year / total_days) - 1
+        annualized_volatility_strategy = daily_returns_df[strategy_col].std() * np.sqrt(trading_days_per_year)
+
+        cumulative_wealth = cumulative_value_df[strategy_col] / self.initial_capital
+        peak = cumulative_wealth.expanding(min_periods=1).max()
+        drawdown = (cumulative_wealth / peak) - 1
+        max_drawdown = drawdown.min()
+
+        min_wealth = cumulative_wealth.expanding(min_periods=1).min()
+        max_gain_series = cumulative_wealth / min_wealth - 1
+        max_gain_period = max_gain_series.max()
+
+        sharpe_ratio = (annualized_return_strategy - (
+                risk_free_rate_daily * trading_days_per_year)) / annualized_volatility_strategy if annualized_volatility_strategy else np.nan
+
+        calmar_ratio = annualized_return_strategy / abs(max_drawdown) if abs(max_drawdown) > 0 else np.nan
+
+        tracking_difference = daily_returns_df[strategy_col] - daily_returns_df[csi_col_daily]
+        tracking_error = tracking_difference.std() * np.sqrt(trading_days_per_year)
+
+        csi_annual_return = (1 + daily_returns_df[csi_col_daily].prod()) ** (trading_days_per_year / total_days) - 1
+        annual_excess_vs_csi = annualized_return_strategy - csi_annual_return
+        information_ratio = annual_excess_vs_csi / tracking_error if tracking_error != 0 else np.nan
+
+        win_days = (daily_returns_df[strategy_col] > daily_returns_df[csi_col_daily]).sum()
+        relative_win_rate = win_days / total_days
+
+        self.metrics_results = {
+            '年化收益率': annualized_return_strategy,
+            '年化波动率': annualized_volatility_strategy,
+            '区间最大涨幅': max_gain_period,
+            '区间最大回撤': abs(max_drawdown),
+            '夏普比率': sharpe_ratio,
+            'Calmar比率': calmar_ratio,
+            '信息比率': information_ratio,
+            '相对基准胜率': relative_win_rate
+        }
+
+        print("\n" + "=" * 50)
+        print(f"======== 策略绩效指标 ({self.STRATEGY_NAME}) ========")
+        print("=" * 50)
+        for name, value in self.metrics_results.items():
+            if name in ['年化收益率', '年化波动率', '区间最大涨幅', '区间最大回撤', '相对基准胜率']:
+                print(f"{name}: {value * 100:.2f}%")
+            else:
+                print(f"{name}: {value:.2f}")
+        print("=" * 50)
+
+
+def plot_performance(results_df, initial_capital=1000000000, strategy_name='最终合并策略'):
+    """
+    绘制投资组合累积收益率图表，适配BL优化策略和两个CSI500基准。
+
+    Args:
+        results_df (pd.DataFrame): 包含策略和基准累计收益率（%）的DataFrame。
+        initial_capital (int): 初始资金，用于图表标题显示。
+        strategy_name (str): 策略名称，用于图例和标题。
+    """
+    if results_df is None or results_df.empty:
+        print("没有可用于绘制的投资组合回测结果。")
+        return
+
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文显示
+    plt.rcParams['axes.unicode_minus'] = False  # 解决负号'-'显示为方块的问题
+
+    plt.figure(figsize=(12, 7))
+
+    # 策略颜色和标签映射
+    strategy_config = {
+        strategy_name: {'color': 'blue', 'label': strategy_name, 'linestyle': '-', 'linewidth': 2},
+        'CSI500_TR_Benchmark': {'color': 'black', 'label': '中证500全收益指数 (TR)', 'linestyle': '--',
+                                'linewidth': 2,
+                                'alpha': 0.8},
+    }
+
+    # 1. 绘图循环
+    plotted_strategies = []
+    for strategy, config in strategy_config.items():
+        if strategy in results_df.columns:
+            data = results_df[strategy]
+            plt.plot(data.index, data.values,
+                     color=config['color'],
+                     label=config['label'],
+                     linestyle=config['linestyle'],
+                     linewidth=config['linewidth'],
+                     alpha=config.get('alpha', 1))
+            plotted_strategies.append((strategy, config['label']))
+
+    # 2. 设置图表样式
+    title_capital = f"初始资金 {initial_capital / 10000:.0f} 万元"
+    # 🚨 修改点 4: 更新图表标题
+    plt.title(f'{strategy_name} vs. 基准指数 ({title_capital})', fontsize=14, fontweight='bold', pad=15)
+
+    plt.xlabel('日期', fontsize=10)
+    plt.ylabel('累积收益率 (%)', fontsize=10)
+    plt.legend(fontsize=10, loc='best')
+    plt.grid(True, linestyle='--', alpha=0.6)
+
+    # 日期格式化
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+    plt.gcf().autofmt_xdate()
+
+    # 绘制零线
+    plt.axhline(y=0, color='red', linestyle='-', alpha=0.5, linewidth=1)
+    plt.tight_layout()
+    plt.show()
+
+    # 3. 打印最终收益率
+    print("\n各策略最终累积收益率统计：")
+    for strategy_col, label in plotted_strategies:
+        final_return = results_df[strategy_col].iloc[-1]
+        print(f"{label}: {final_return:.2f}%")
+
+
+# =========================================================================
+# === 调用函数和执行回测的示例代码 ===
+# =========================================================================
+
+if __name__ == '__main__':
+    # --- 1. 定义文件路径 (请根据您的实际文件路径修改) ---
+    BASE_DATA_PATH = r"C:\Users\cufet\Desktop\测试集"
+
+    STOCK_PRICE_FILE = r"中证500成分股数据-快照2.xlsx"
+    CSI500_TOTAL_RETURN_FILE = r"C:\Users\cufet\Desktop\测试集\CSI500_TotalReturn.xls"  # 中证500全收益指数数据文件名
+    CSI500_SIMPLE_RETURN_FILE = r"C:\Users\cufet\Desktop\测试集\CSI500_SimpleReturn.xls"  # 中证500普通收益指数数据文件名
+
+    # 🚨 定义新的输出文件名
+    OUTPUT_HOLDINGS_FILE = "最终合并策略_持仓市值详情.xlsx"
+
+    # --- 2. 实例化回测器 ---
+    try:
+        backtester = SimplePortfolioBacktester(
+            data_path=BASE_DATA_PATH,
+            stock_data_file=STOCK_PRICE_FILE,
+            csi_data_file=CSI500_TOTAL_RETURN_FILE,
+            csi500_simple_data_file=CSI500_SIMPLE_RETURN_FILE
+        )
+
+    except Exception as e:
+        print(f"\n[致命错误] 实例化回测器失败，请检查文件路径和加载逻辑: {e}")
+        exit()
+
+    # --- 3. 执行回测 ---
+    print("\n" + "#" * 60)
+    print("############ 正在执行回测: 最终合并策略 ############")
+    print("#" * 60)
+
+    # 设置回测区间
+    results_df = backtester.run_backtest(
+        start_date='2023-01-20',
+        end_date='2025-09-30'
+    )
+
+    # --- 4. 结果处理 ---
+    if results_df is not None and not results_df.empty:
+        print("\n--- 最终回测累计收益率 (%) ---")
+        print(results_df.tail(1))
+
+        # --- 5. 导出持仓详情 (🚨 使用新的输出文件名) ---
+        backtester._output_holdings_to_excel(
+            output_file_name=OUTPUT_HOLDINGS_FILE
+        )
+
+    else:
+        print("\n回测执行失败或结果为空。")
+
+    if results_df is not None and not results_df.empty:
+        # 🚨 传入策略名称进行绘图
+        plot_performance(
+            results_df,
+            initial_capital=backtester.initial_capital,
+            strategy_name=backtester.STRATEGY_NAME
+        )
+
+    print("\n回测程序运行结束。")
