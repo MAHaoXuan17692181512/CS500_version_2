@@ -1,0 +1,168 @@
+import pandas as pd
+import numpy as np
+import warnings
+
+# 忽略不必要的警告
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# --- 假设文件路径和Sheet名称 ---
+file_path = r"C:\Users\cufet\Desktop\测试集\最终合并权重_70_30.xlsx"
+
+# 假设您的文件包含三个工作表
+SHEET_STRATEGY_WEIGHT = '基础权重'  # 策略持仓金额/市值
+SHEET_RETURN = '资产收益'  # 资产收益率
+SHEET_BENCHMARK_WEIGHT = '资产权重'  # 基准持仓金额/市值
+
+try:
+    # 策略持仓数据
+    data_strategy_holding = pd.read_excel(file_path, sheet_name=SHEET_STRATEGY_WEIGHT)
+    # 资产收益率
+    data_return = pd.read_excel(file_path, sheet_name=SHEET_RETURN)
+    # 基准持仓数据
+    data_benchmark_holding = pd.read_excel(file_path, sheet_name=SHEET_BENCHMARK_WEIGHT)
+
+except FileNotFoundError:
+    print("【警告】文件未找到，正在使用模拟数据进行演示。")
+
+
+# 1. 预处理：标准化列名
+code_col = data_strategy_holding.columns[0]
+industry_col = data_strategy_holding.columns[1]
+
+data_strategy_holding = data_strategy_holding.rename(columns={code_col: '代码', industry_col: '二级行业'})
+data_return = data_return.rename(columns={code_col: '代码', industry_col: '二级行业'})
+data_benchmark_holding = data_benchmark_holding.rename(columns={code_col: '代码', industry_col: '二级行业'})
+
+# 2. 确定日期列
+date_columns = data_strategy_holding.columns[2:]
+
+# 存储全局汇总结果
+results = []
+# 存储所有期、所有行业的详细数据（用于后续汇总和图表）
+all_industry_attribution_data = []
+
+# -----------------------------------------------------------
+# I. 核心 Brinson 归因循环：计算全局结果并收集行业数据
+# -----------------------------------------------------------
+for date_col in date_columns:
+    print(f"\nProcessing date: {date_col}")
+
+    # 3. 数据合并
+    df_hp = data_strategy_holding[['代码', '二级行业', date_col]].rename(columns={date_col: 'H_P'})
+    df_rp = data_return[['代码', date_col]].rename(columns={date_col: 'R_P'})
+    df_hb = data_benchmark_holding[['代码', date_col]].rename(columns={date_col: 'H_B'})
+
+    current_data = pd.merge(df_hp, df_rp, on='代码', how='inner')
+    current_data = pd.merge(current_data, df_hb, on='代码', how='inner')
+
+    # 4. 清理和计算 Wp, Wb
+    current_data.dropna(subset=['H_P', 'R_P', 'H_B'], inplace=True)
+
+    total_h_p = current_data['H_P'].sum()
+    total_h_b = current_data['H_B'].sum()
+
+    if total_h_p == 0 or total_h_b == 0:
+        print(f"Skipping date {date_col}: Total holding is zero.")
+        continue
+
+    current_data['W_P'] = current_data['H_P'] / total_h_p
+    current_data['W_B'] = current_data['H_B'] / total_h_b
+
+    # 5. 计算行业级指标 (w_P, w_B, r_P, r_B)
+    industry_weights = current_data.groupby('二级行业')['W_P'].sum().reset_index(name='w_P')
+    industry_weights_b = current_data.groupby('二级行业')['W_B'].sum().reset_index(name='w_B')
+
+    industry_returns_P = current_data.groupby('二级行业').apply(
+        lambda x: (x['W_P'] * x['R_P']).sum() / x['W_P'].sum() if x['W_P'].sum() != 0 else np.nan
+    ).reset_index(name='r_P').dropna()
+
+    industry_returns_B = current_data.groupby('二级行业').apply(
+        lambda x: (x['W_B'] * x['R_P']).sum() / x['W_B'].sum() if x['W_B'].sum() != 0 else np.nan
+    ).reset_index(name='r_B').dropna()
+
+    # 6. 合并行业级数据
+    data_analysis = pd.merge(industry_weights, industry_weights_b, on='二级行业', how='inner')
+    data_analysis = pd.merge(data_analysis, industry_returns_P, on='二级行业', how='inner')
+    data_analysis = pd.merge(data_analysis, industry_returns_B, on='二级行业', how='inner')
+
+    # 7. Brinson 模型分解 (行业级)
+    data_analysis['AR'] = (data_analysis['w_P'] - data_analysis['w_B']) * data_analysis['r_B']
+    data_analysis['SR'] = (data_analysis['r_P'] - data_analysis['r_B']) * data_analysis['w_B']
+    data_analysis['IR'] = (data_analysis['w_P'] - data_analysis['w_B']) * (data_analysis['r_P'] - data_analysis['r_B'])
+
+    # 8. 汇总至全局结果 (用于 results 列表)
+    R_P_total = (current_data['W_P'] * current_data['R_P']).sum()
+    R_B_total = (current_data['W_B'] * current_data['R_P']).sum()
+    Excess_Return = R_P_total - R_B_total
+    Attribution_Sum = data_analysis['AR'].sum() + data_analysis['SR'].sum() + data_analysis['IR'].sum()
+
+    results.append({
+        'Date': date_col,
+        '策略收益(R_P)': R_P_total,
+        '基准收益(R_B)': R_B_total,
+        '超额收益(R_P - R_B)': Excess_Return,
+        '配置收益(AR)': data_analysis['AR'].sum(),
+        '选择收益(SR)': data_analysis['SR'].sum(),
+        '交互收益(IR)': data_analysis['IR'].sum(),
+        '归因总和(AR+SR+IR)': Attribution_Sum,
+        '差异(检查项)': Excess_Return - Attribution_Sum
+    })
+
+    # 9. 存储行业数据 (用于后续计算)
+    data_analysis['Date'] = date_col
+    data_analysis['主动权重差'] = data_analysis['w_P'] - data_analysis['w_B']
+    data_analysis['主动收益差'] = data_analysis['r_P'] - data_analysis['r_B']
+    all_industry_attribution_data.append(data_analysis)
+
+# -----------------------------------------------------------
+# II. 结果输出 - 整合所有需求
+# -----------------------------------------------------------
+
+# 将所有行业的每日数据合并成一个 DataFrame
+if all_industry_attribution_data:
+    final_industry_df = pd.concat(all_industry_attribution_data)
+else:
+    final_industry_df = pd.DataFrame()
+
+# -----------------
+# 结果 1: 按天（不分行业）的 Brinson 全局汇总数据
+# -----------------
+results_df = pd.DataFrame(results)
+output_file_path = r"C:\Users\cufet\Desktop\Output_1_Global_Daily_Brinson_Summary.xlsx"
+results_df.to_excel(output_file_path, index=False)
+print(f"\n✅ 1. 全局每日 Brinson 汇总结果已保存至: {output_file_path}")
+
+# -----------------
+# 结果 2 & 3: 按行业分期和总计的图表数据
+# -----------------
+if not final_industry_df.empty:
+
+    # 2. 按行业分期的图表数据 (交互收益、主动权重差、主动收益差)
+    chart_data_daily = final_industry_df[['Date', '二级行业', 'IR', '主动权重差', '主动收益差']].copy()
+    output_chart_data_path = r"C:\Users\cufet\Desktop\Output_2_Industry_Daily_Chart_Data.xlsx"
+    chart_data_daily.to_excel(output_chart_data_path, index=False)
+    print(f"✅ 2. 行业每日图表数据（IR, 主动差额）已保存至: {output_chart_data_path}")
+
+    # 3. 按行业汇总的总计交互收益、主动收益差、主动权重差
+    industry_average_summary = final_industry_df.groupby('二级行业').agg(
+        平均交互收益=('IR', 'mean'),
+        平均主动权重差=('主动权重差', 'mean'),
+        平均主动收益差=('主动收益差', 'mean')
+    ).reset_index()
+
+    # 注意：'总计主动权重差'和'总计主动收益差'通常用于累计分析，这里按时间序列求和。
+    # 交互收益IR可以直接求和。
+    output_industry_total_path = r"C:\Users\cufet\Desktop\Output_3_Industry_Total_Chart_Summary.xlsx"
+    industry_average_summary.to_excel(output_industry_total_path, index=False)
+    print(f"✅ 3. 行业总计图表数据（总计 IR, 主动差额）已保存至: {output_industry_total_path}")
+
+
+else:
+    print("\n❌ 无法输出行业级别数据，因为没有有效数据被处理。请检查您的 Excel 文件。")
+
+# 打印最终结果概览
+print("\n--- 🔥 最终输出文件列表 ---")
+print(f"1. 全局每日 Brinson 汇总: {output_file_path}")
+print(f"2. 行业每日图表数据: {output_chart_data_path}")
+print(f"3. 行业总计图表数据: {output_industry_total_path}")
